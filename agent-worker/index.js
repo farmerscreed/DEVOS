@@ -128,9 +128,10 @@ async function processJob(job) {
     console.log(`\n[Job ${jobId}] Processing ${agent_type} for org ${orgId}`);
     console.log(`[Job ${jobId}] Attempt: ${attempts + 1} of ${MAX_ATTEMPTS}`);
 
+    let llmConfig;
     try {
         // Get LLM config for this organisation and agent type
-        const llmConfig = await getLLMConfig(orgId, agent_type);
+        llmConfig = await getLLMConfig(orgId, agent_type);
         const model = llmConfig.primary_model;
 
         // Build messages from payload
