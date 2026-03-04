@@ -513,7 +513,7 @@ async function logAgentExecution(orgId, agentType, logData) {
         .insert({
             organisation_id: orgId,
             agent_type: agentType,
-            event_type: 'execution',
+            event_type: 'tool_call',
             ...logData
         });
 
