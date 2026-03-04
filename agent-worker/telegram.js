@@ -10,6 +10,20 @@ const supabase = createClient(supabaseUrl, supabaseServiceKey, {
 
 const activeBots = new Map();
 
+// Graceful shutdown: stop all bots cleanly on SIGTERM (Railway sends this on redeploy)
+process.on('SIGTERM', async () => {
+    console.log('[Telegram] SIGTERM received — stopping all bots gracefully...');
+    const stopPromises = [];
+    for (const [orgId, bot] of activeBots.entries()) {
+        console.log(`[Telegram] Stopping bot for org ${orgId}`);
+        stopPromises.push(bot.stopPolling());
+    }
+    await Promise.allSettled(stopPromises);
+    activeBots.clear();
+    console.log('[Telegram] All bots stopped. Exiting.');
+    process.exit(0);
+});
+
 async function startTelegramBots() {
     console.log('[Telegram] Checking for active Telegram credentials...');
 
@@ -46,7 +60,23 @@ async function startTelegramBots() {
         if (!activeBots.has(orgId)) {
             console.log(`[Telegram] Starting bot for org: ${orgName}`);
 
-            const bot = new TelegramBot(botToken, { polling: true });
+            // Create bot without polling first, so we can clear stale sessions
+            const bot = new TelegramBot(botToken, { polling: false });
+
+            // deleteWebHook also forces Telegram to close any stale getUpdates session
+            // This is the key fix for Railway 409 Conflict on redeploy
+            try {
+                await bot.deleteWebHook({ drop_pending_updates: true });
+                console.log(`[Telegram] Cleared stale session for org: ${orgName}`);
+            } catch (e) {
+                console.warn(`[Telegram] Could not clear stale session: ${e.message}`);
+            }
+
+            // Small delay to let any old container's polling timeout expire (Telegram ~1s)
+            await new Promise(resolve => setTimeout(resolve, 2000));
+
+            // Now start polling — dropPendingUpdates skips any messages queued while bot was offline
+            bot.startPolling({ restart: false, polling: { params: { timeout: 10 } } });
             activeBots.set(orgId, bot);
 
             bot.on('message', async (msg) => {
