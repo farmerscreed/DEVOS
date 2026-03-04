@@ -60,22 +60,41 @@ async function startTelegramBots() {
         if (!activeBots.has(orgId)) {
             console.log(`[Telegram] Starting bot for org: ${orgName}`);
 
-            // Create bot without polling first, so we can clear stale sessions
-            const bot = new TelegramBot(botToken, { polling: false });
-
-            // deleteWebHook also forces Telegram to close any stale getUpdates session
-            // This is the key fix for Railway 409 Conflict on redeploy
+            // ── Step 1: Force-close ANY stale getUpdates session ──
+            // A raw getUpdates call with timeout=0 immediately terminates
+            // any long-polling connection on Telegram's side.
             try {
-                await bot.deleteWebHook({ drop_pending_updates: true });
+                const https = require('https');
+                await new Promise((resolve, reject) => {
+                    const url = `https://api.telegram.org/bot${botToken}/deleteWebhook?drop_pending_updates=true`;
+                    https.get(url, (res) => {
+                        let d = '';
+                        res.on('data', c => d += c);
+                        res.on('end', () => { console.log(`[Telegram] deleteWebhook result:`, d); resolve(); });
+                    }).on('error', reject);
+                });
+
+                // Force a short getUpdates to steal the session from any other instance
+                await new Promise((resolve, reject) => {
+                    const url = `https://api.telegram.org/bot${botToken}/getUpdates?offset=-1&timeout=0`;
+                    https.get(url, (res) => {
+                        let d = '';
+                        res.on('data', c => d += c);
+                        res.on('end', () => { console.log(`[Telegram] Force getUpdates result:`, d.substring(0, 100)); resolve(); });
+                    }).on('error', reject);
+                });
+
                 console.log(`[Telegram] Cleared stale session for org: ${orgName}`);
             } catch (e) {
                 console.warn(`[Telegram] Could not clear stale session: ${e.message}`);
             }
 
-            // Small delay to let any old container's polling timeout expire (Telegram ~1s)
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            // ── Step 2: Wait for Telegram to fully release the old session ──
+            console.log(`[Telegram] Waiting 5s for old session to fully release...`);
+            await new Promise(resolve => setTimeout(resolve, 5000));
 
-            // Now start polling — dropPendingUpdates skips any messages queued while bot was offline
+            // ── Step 3: Start polling ──
+            const bot = new TelegramBot(botToken, { polling: false });
             bot.startPolling({ restart: false, polling: { params: { timeout: 10 } } });
             activeBots.set(orgId, bot);
 
@@ -83,8 +102,27 @@ async function startTelegramBots() {
                 await handleInboundMessage(orgId, orgName, bot, msg);
             });
 
-            bot.on('polling_error', (err) => {
-                console.error(`[Telegram] Polling error for org ${orgName}:`, err.message);
+            // ── Step 4: Handle 409 with auto-recovery ──
+            let conflictRetries = 0;
+            bot.on('polling_error', async (err) => {
+                if (err.message && err.message.includes('409 Conflict')) {
+                    conflictRetries++;
+                    console.warn(`[Telegram] 409 Conflict for ${orgName} (retry ${conflictRetries})`);
+                    if (conflictRetries <= 5) {
+                        // Stop, wait, then restart polling
+                        await bot.stopPolling();
+                        const backoff = conflictRetries * 3000; // 3s, 6s, 9s, 12s, 15s
+                        console.log(`[Telegram] Backing off ${backoff / 1000}s before retry...`);
+                        await new Promise(r => setTimeout(r, backoff));
+                        bot.startPolling({ restart: false, polling: { params: { timeout: 10 } } });
+                    } else {
+                        console.error(`[Telegram] Too many 409 conflicts for ${orgName}. Stopping bot. Another instance may be running.`);
+                        await bot.stopPolling();
+                        activeBots.delete(orgId);
+                    }
+                } else {
+                    console.error(`[Telegram] Polling error for org ${orgName}:`, err.message);
+                }
             });
         }
     }
