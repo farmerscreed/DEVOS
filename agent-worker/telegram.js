@@ -135,6 +135,57 @@ async function handleInboundMessage(orgId, orgName, bot, msg) {
 
     console.log(`[Telegram] Inbound message from ${chatId}: ${text}`);
 
+    // ── Handle /start deep link from lead form thank-you page ──
+    // When lead clicks t.me/BotName?start=lead_UUID, Telegram sends: /start lead_UUID
+    if (text.startsWith('/start lead_')) {
+        const leadId = text.replace('/start lead_', '').trim();
+        if (leadId) {
+            // Link this telegram chat to the existing lead from the form
+            const { data: existingLead } = await supabase
+                .from('leads')
+                .select('id, name, telegram_chat_id')
+                .eq('id', leadId)
+                .eq('organisation_id', orgId)
+                .single();
+
+            if (existingLead) {
+                // Update the lead with their Telegram chat ID
+                await supabase.from('leads').update({
+                    telegram_chat_id: String(chatId),
+                    preferred_channel: 'telegram',
+                    conversation_state: 'intake',
+                    phone: existingLead.phone || `tg_${chatId}`
+                }).eq('id', leadId);
+
+                console.log(`[Telegram] Linked chatId ${chatId} to existing lead ${leadId} (${existingLead.name})`);
+
+                // Queue a greeting that references their form details
+                await supabase.from('agent_queue').insert({
+                    organisation_id: orgId,
+                    agent_type: 'presell',
+                    status: 'pending',
+                    attempts: 0,
+                    max_attempts: 3,
+                    lead_id: leadId,
+                    payload: {
+                        action: 'new_lead_greeting',
+                        lead_name: existingLead.name,
+                        lead_phone: `tg_${chatId}`,
+                        chat_id: String(chatId),
+                        content: text,
+                        conversation_turns: 0,
+                        channel: 'telegram',
+                        messages: [{
+                            role: 'user',
+                            content: `${existingLead.name} just arrived from the registration form and clicked your Telegram link. Greet them warmly by name, reference that they registered and you're here to help. Do NOT ask questions they already answered in the form — instead, acknowledge their interest and offer to tell them more about available units matching their profile.`
+                        }]
+                    }
+                });
+                return; // Handled — don't fall through to normal flow
+            }
+        }
+    }
+
     // 1. Find or create lead
     // We use `tg_${chatId}` as a pseudo-phone number to uniquely identify telegram leads
     const pseudoPhone = `tg_${chatId}`;

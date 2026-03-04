@@ -31,6 +31,8 @@ export default function LeadForm({ organisation }: LeadFormProps) {
     const [submitting, setSubmitting] = useState(false)
     const [submitted, setSubmitted] = useState(false)
     const [error, setError] = useState<string | null>(null)
+    const [leadId, setLeadId] = useState<string | null>(null)
+    const [telegramBotUsername, setTelegramBotUsername] = useState<string | null>(null)
 
     const handleChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
         setForm({ ...form, [e.target.name]: e.target.value })
@@ -61,7 +63,7 @@ export default function LeadForm({ organisation }: LeadFormProps) {
 
             const category = score >= 70 ? 'hot' : score >= 50 ? 'warm' : 'cold'
 
-            const { error: insertError } = await supabase.from('leads').insert({
+            const { data, error: insertError } = await supabase.from('leads').insert({
                 organisation_id: organisation.id,
                 name: form.name,
                 phone: form.phone,
@@ -77,9 +79,31 @@ export default function LeadForm({ organisation }: LeadFormProps) {
                 status: 'new',
                 preferred_channel: 'whatsapp',
                 ...utm,
-            })
+            }).select('id').single()
 
             if (insertError) throw insertError
+
+            // Store the new lead ID for the Telegram deep link
+            if (data) setLeadId(data.id)
+
+            // Fetch Telegram bot username from org credentials (public-ish, non-secret)
+            try {
+                const { data: cred } = await supabase
+                    .from('org_credentials')
+                    .select('credentials')
+                    .eq('organisation_id', organisation.id)
+                    .eq('provider', 'telegram')
+                    .eq('status', 'active')
+                    .single()
+
+                if (cred) {
+                    let parsed = cred.credentials
+                    if (typeof parsed === 'string') parsed = JSON.parse(parsed)
+                    if (parsed?.bot_username) setTelegramBotUsername(parsed.bot_username)
+                }
+            } catch {
+                // Telegram not configured — no deep link shown
+            }
 
             setSubmitted(true)
         } catch (err: unknown) {
@@ -90,6 +114,10 @@ export default function LeadForm({ organisation }: LeadFormProps) {
     }
 
     if (submitted) {
+        const telegramUrl = telegramBotUsername && leadId
+            ? `https://t.me/${telegramBotUsername}?start=lead_${leadId}`
+            : null
+
         return (
             <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
                 <div className="max-w-md w-full bg-white rounded-2xl shadow-sm border border-gray-100 p-8 text-center">
@@ -98,8 +126,37 @@ export default function LeadForm({ organisation }: LeadFormProps) {
                     </div>
                     <h2 className="text-2xl font-bold text-gray-900 mb-2">You're registered!</h2>
                     <p className="text-gray-600 mb-6">
-                        Our consultant will reach out via WhatsApp within the next few minutes. Please keep your phone handy.
+                        Our consultant will reach out via WhatsApp shortly. Or, start chatting with us right now:
                     </p>
+
+                    {/* Channel options */}
+                    <div className="flex flex-col gap-3 mb-6">
+                        {telegramUrl && (
+                            <a
+                                href={telegramUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="flex items-center justify-center gap-2 bg-[#229ED9] text-white px-6 py-3 rounded-xl font-semibold hover:bg-[#1a8bbf] transition-colors"
+                            >
+                                <span className="text-xl">✈️</span>
+                                Chat with us on Telegram
+                            </a>
+                        )}
+                        <a
+                            href={`https://wa.me/?text=Hi, I just registered interest in ${encodeURIComponent(organisation.name)}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-center justify-center gap-2 bg-[#25D366] text-white px-6 py-3 rounded-xl font-semibold hover:bg-[#1dab55] transition-colors"
+                        >
+                            <span className="text-xl">📱</span>
+                            Message us on WhatsApp
+                        </a>
+                    </div>
+
+                    <p className="text-xs text-gray-400 mb-4">
+                        You can also wait — our team will contact you on WhatsApp within a few minutes.
+                    </p>
+
                     <button onClick={() => navigate('/')} className="text-blue-600 hover:underline text-sm">
                         ← Back to {organisation.name}
                     </button>
