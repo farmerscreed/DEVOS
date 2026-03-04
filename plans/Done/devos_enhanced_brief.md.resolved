@@ -1,0 +1,438 @@
+# DEVOS — Enhanced Product & Implementation Brief
+
+**Prepared by:** Senior Product Strategist & Solutions Architect
+**Date:** 4 March 2026
+**Inputs:** DEVOS PRD v1.2 · DEVOS Implementation Plan v1.0
+
+---
+
+## 1. Product Summary
+
+DEVOS is a multi-tenant, AI-powered operating system for off-plan real estate developers in Nigeria and West Africa. It replaces the fragmented stack of sales agents, financial controllers, ad managers, and project coordinators with three integrated modules — **PRESELL** (autonomous lead-to-sale pipeline via WhatsApp + paid ads), **GUARDIAN** (AI budget watchdog that catches overcharges before payment), and **COMMAND** (a single-screen daily dashboard). The developer spends 15–20 minutes per day reviewing a morning brief, approving flagged invoices, and taking hot-lead calls. Everything else runs autonomously via a purpose-built Claude-powered agent system with per-organisation data isolation. Built first on Primerose Smart City Cluster (200-unit development, Rivers State), DEVOS is architected as SaaS from Sprint 1 and targets three paying external clients within six months.
+
+---
+
+## 2. What's Strong — Keep As Is
+
+These are the parts both documents got right. Do not second-guess them.
+
+| # | What's Strong | Source |
+|---|--------------|--------|
+| 1 | **Multi-tenant from Sprint 1.** Shared DB + `organisation_id` on every table + RLS is the correct call. The PRD's rationale for why separate instances per client is wrong is airtight. | PRD §5.1 |
+| 2 | **DEVOS Agent Engine ≠ OpenClaw.** The PRD draws a hard, clean line. The agent engine is a product component; OpenClaw is a private tool with read-only access. This distinction protects the product's independence. | PRD §4.1, §5.6 |
+| 3 | **Edge Functions replace n8n entirely.** Correct decision. Removes a runtime dependency, keeps deterministic routing fast and cheap, and limits AI costs to tasks that actually need reasoning. | PRD §4.1 |
+| 4 | **Per-client credential injection via Supabase Vault.** One MCP infrastructure, per-org credentials at call time. Scalable and secure. | PRD §4.4 |
+| 5 | **Agent permission boundaries (CAN / CANNOT table).** The PRD's explicit table of what the agent can and cannot do autonomously is one of the strongest parts of the entire document. It removes ambiguity for both developers and users. | PRD §4.4 |
+| 6 | **Phased build order in the plan.** Phase 1 delivers lead capture, Phase 2 adds financial controls, Phase 3 adds intelligence. This is the right sequence — you ship revenue-generating capability first. | Plan §Phases |
+| 7 | **Evidence-gated invoice submission.** The Contractor Portal physically blocks submission until all photos and certificates are uploaded. This is the single most important fraud-prevention control in the system. | PRD §6.4 |
+| 8 | **Payment Ticket as the only path to outbound payment.** No Payment Ticket, no payment. Simple, auditable, enforceable. | PRD §6.5 |
+| 9 | **Lead scoring algorithm with concrete point values.** Testable, tunable, transparent. Much better than vague "AI decides." | PRD §5.2.2 |
+| 10 | **WhatsApp qualification flow states.** The 9-state machine (INTAKE → DEAD) is well-defined and covers the real-world funnel. | PRD §5.2.3 |
+| 11 | **Agent hand-off specifications in the plan.** Clear delineation of who (Frontend Agent, Backend Agent, AI Agent Developer, MCP Developer) owns each task. This is essential for parallel workstreams. | Plan §Hand-offs |
+| 12 | **Acceptance criteria per phase.** Each phase has measurable, testable exit criteria. This prevents scope drift. | Plan §Phase 1–3 |
+
+---
+
+## 3. Gaps in the PRD
+
+Requirements that were vague, missing, or underspecified. Each gap includes the requirement as it should have been written.
+
+### 3.1 Missing: Finance View
+
+The PRD lists "Finance View — Payment ticket queue, outbound payment confirmation" in the Presentation Layer but never specifies its components, permissions, or workflow.
+
+> **Corrected Requirement:** The Finance View shall display all Payment Tickets in status PENDING, grouped by urgency. For each ticket, it shall show: contractor name, amount, approval reference, approver name, approval timestamp, and a button to mark as PAID with required fields: bank reference number, payment date, and optional screenshot upload. Only users with role `finance` within the organisation shall access this view. Marking a ticket as PAID shall trigger `on-payment-confirmed` and update the GUARDIAN budget dashboard in real time.
+
+### 3.2 Missing: Site Manager Progress Submission
+
+The PRD mentions the Site Manager submits progress updates and purchase requests, but never defines the interface or data model for progress submissions.
+
+> **Corrected Requirement:** The Site Manager View shall include a "Submit Progress Update" form with fields: phase (dropdown from project phases), percent complete (numeric, 0–100), written summary (text, required, min 50 chars), and photo uploads (minimum 3 photos, geotagged if device supports it). On submission, the `on-progress-update` Edge Function fires, updates the Buyer Portal construction progress bars, and cross-references against any pending invoices claiming work on the same phase. A new `progress_updates` row is created with `organisation_id`, `project_id`, `phase_id`, `reported_by`, `percent_complete`, `summary`, `photo_urls[]`, and `submitted_at`.
+
+### 3.3 Missing: Payment Schedule Data Model
+
+The PRD describes payment plans extensively (reminder sequences, overdue escalation, buyer portal payment tracker) but never defines the underlying `payment_schedule` table.
+
+> **Corrected Requirement:** A `payment_schedule` table shall exist with columns: `id`, `organisation_id`, `buyer_id`, `reservation_id`, `instalment_number`, `amount`, `currency`, `due_date`, `status` (PENDING | PAID | OVERDUE | DEFAULTED), `paid_at`, `payment_in_id` (FK to `payments_in`). This table is the single source of truth for the payment reminder Edge Functions and the Buyer Portal payment tracker. It is auto-generated when a reservation is confirmed and the payment plan is agreed.
+
+### 3.4 Missing: Full Overdue Escalation Logic
+
+The PRD defines the reminder sequence (7d, 3d, due date, 3d late, 7d late, 14d late, 30d late) in §5.2.6, but the Edge Functions register only lists `payment-reminder-7d`, `payment-reminder-3d`, and `payment-overdue`. The implementation plan only builds the 7d and 3d reminders.
+
+> **Corrected Requirement:** The `payment-overdue` Edge Function shall implement the full escalation chain: due-date notice, 3-day gentle follow-up, 7-day formal notice, 14-day sales agent escalation (creates a task for the assigned sales agent), and 30-day auto-generation of Notice of Default letter (stored as DRAFT, requires developer approval before sending). Each stage shall be logged with timestamp and delivery status.
+
+### 3.5 Missing: Buyer Authentication Flow
+
+The PRD says buyers access the Buyer Portal but never specifies how they authenticate. Magic link? Password set during reservation? Invited by the system?
+
+> **Corrected Requirement:** When a reservation is confirmed, the system shall create a Supabase Auth account for the buyer using their WhatsApp-registered phone number and email. The buyer receives a magic link via email and a WhatsApp message with a link to set their password. Subsequent logins use email + password. Password reset via magic link. The buyer's role is `buyer` and their RLS policy restricts access to their own reservation, payments, and documents only.
+
+### 3.6 Underspecified: Contractor Authentication
+
+Same issue as buyer auth — the PRD says contractors log into the Contractor Portal but never defines how their accounts are created.
+
+> **Corrected Requirement:** When a contractor is added to the `contractors` table by the developer or site manager, the system shall send an email invitation with a magic link to create credentials. Contractor role is `contractor`. RLS restricts access to: their own invoices, their own payment status, and project progress data for projects they are assigned to. They cannot see budget data, other contractor invoices, or buyer information.
+
+### 3.7 Missing: Currency Handling
+
+The PRD references ₦, GBP, and USD throughout (diaspora pricing, Stripe for international billing) but never defines whether the system stores amounts in multiple currencies or converts.
+
+> **Corrected Requirement:** All financial amounts in the database shall be stored in Nigerian Naira (₦) as the canonical currency. All `amount` columns are BIGINT representing kobo (smallest unit). The frontend shall display ₦ amounts natively and, for diaspora-facing views (landing page, WhatsApp messages), shall display an approximate equivalent in GBP/USD using a daily exchange rate stored in a `config` table. Exchange rates are informational only — all contracts and payments are denominated in ₦.
+
+### 3.8 Naming Inconsistency: OpenClaw References
+
+The PRD's prose sections (§8.3, §9, Appendix B) still reference "OpenClaw" in places where they clearly mean "DEVOS Agent Engine." The Edge Functions register says "call OpenClaw PRESELL Agent." The Appendix B team table says "OpenClaw agent configuration." This contradicts the PRD's own explicit distinction in §4.1 and §5.6.
+
+> **Corrected Requirement:** A global find-and-replace must be performed on both the PRD and Implementation Plan. Every reference to "OpenClaw" that describes a DEVOS product function must be changed to "DEVOS Agent Engine" or the specific agent name (e.g., "DEVOS PRESELL Agent"). OpenClaw should only appear in the §5.6 relationship definition and the morning brief flow where Law's personal tool reads DEVOS data.
+
+### 3.9 Missing: 2FA Implementation
+
+PRD §10.1 states "Developer account protected with mandatory 2FA" but provides no specification.
+
+> **Corrected Requirement:** Users with role `org_admin` (developer) shall be required to enable TOTP-based 2FA (via Supabase Auth MFA) on first login. Login without 2FA shall be blocked after a 7-day grace period. Super admins shall always require 2FA with no grace period.
+
+### 3.10 Missing: Feature Flags and Org Impersonation
+
+PRD §5.5 lists "Feature flags per organisation" and "Impersonate organisation (read-only)" as Super Admin capabilities. Neither is defined.
+
+> **Corrected Requirement:** A `feature_flags` table shall exist with columns: `organisation_id`, `flag_name` (enum), `enabled` (boolean), `updated_by`, `updated_at`. Flags control access to modules (e.g., GUARDIAN, AdEngine) and experimental features. The Super Admin panel shall include an "Impersonate" button per org that sets a read-only session context showing that org's dashboard, leads, and data without write permissions. All impersonation sessions are logged.
+
+---
+
+## 4. Gaps in the Implementation Plan
+
+### 4.1 No DEVOS Agent Engine Architecture Definition
+
+**Risk:** This is the core of the product and it has zero architectural detail. How does it run? Is it a long-running process? A Supabase Edge Function? A separate Node.js service? How does it handle concurrent calls from multiple orgs? What is the cost model?
+
+**What should be added:** A dedicated task in Sprint 1 (not Sprint 7) that defines and implements the Agent Engine runtime. Recommended: a Supabase Edge Function that accepts a JSON payload (agent_type, org_id, context), calls Claude API, executes MCP tool calls in a loop, and writes results back. Stateless. One invocation per event. Concurrency is handled by Supabase's Edge Function runtime. Cost is metered per Claude API call, tracked in `mcp_tool_calls` and attributable to `organisation_id`.
+
+### 4.2 Error Handling Deferred to Phase 4
+
+**Risk:** The plan's T11.11 "Comprehensive error handling" is in Phase 4. This means Phases 1–3 ship with no defined error handling strategy. A failed Claude API call during a WhatsApp conversation, a Supabase timeout during invoice submission, or a rate-limited WhatsApp send will produce silent failures or ugly crashes.
+
+**What should be added:** A foundational error handling pattern must be established in Sprint 1:
+- Every Edge Function wraps its core logic in try/catch and logs failures to an `error_logs` table.
+- Claude API calls have a 30-second timeout with OpenRouter fallback.
+- WhatsApp sends have retry (1x after 5s) then email fallback.
+- All user-facing errors return a friendly message, not a stack trace.
+- Agent failures are logged to `agent_logs` with status `FAILED` and the Edge Function returns gracefully.
+
+### 4.3 No Database Migration Strategy
+
+**Risk:** The plan builds all tables in Sprint 1 and then modifies the schema across 14 subsequent sprints. There is no mention of migration tooling.
+
+**What should be added:** Use Supabase CLI migrations from Sprint 1. Every schema change is a numbered migration file committed to the repo. `supabase db push` applies migrations to production. This is table stakes for a multi-sprint project.
+
+### 4.4 Sprint 7 is Overloaded
+
+**Risk:** Sprint 7 tasks include building 3 custom MCP servers (meta-ads, tiktok-ads, veo3), the campaign setup UI, the audience library, Magic Link tracking, AdEngine agent prompt, Creative Factory, and approval workflow. That is at least 3 weeks of work compressed into 1.
+
+**What should be added:** Split Sprint 7 into two sprints. Move tiktok-ads-mcp and veo3-mcp to Sprint 8 or later. The Meta Ads integration alone is a full sprint of work. TikTok and Veo3 are not needed for MVP Ad operations.
+
+### 4.5 No API Contract Process
+
+**Risk:** The plan assigns frontend and backend tasks in parallel across sprints but never defines how they agree on API contracts. Frontend will build components that don't match the data shapes backend returns.
+
+**What should be added:** Before each sprint, spend 2 hours defining API contracts (request/response shapes, error codes) in a shared document or OpenAPI spec. Frontend and backend build against the contract independently. This prevents integration week from becoming debugging week.
+
+### 4.6 No Staging Environment
+
+**Risk:** There is no mention of a staging or preview environment. All testing appears to happen against production Supabase.
+
+**What should be added:** Use Supabase branching (or a second Supabase project) for staging. Vercel preview deployments (automatic on PR) serve as frontend staging. Edge Functions are tested against the staging Supabase project before deploying to production.
+
+### 4.7 Missing `payments_out` Integration
+
+**Risk:** The PRD defines a `payments_out` table for outbound construction payments, but the implementation plan never creates it or builds any UI to record completed payments. Finance confirms payment externally, but DEVOS never records the actual outflow.
+
+**What should be added:** In Sprint 5, add a task: "Build payments_out recording: when finance marks a Payment Ticket as PAID, create a `payments_out` record with amount, date, contractor_id, payment_ticket_id, bank_reference. This record feeds the GUARDIAN budget burn calculation."
+
+### 4.8 BOQ/Contract Parsing Underestimated
+
+**Risk:** Task T4.2 says "Build BOQ and contract upload + parsing." BOQ documents are messy PDFs with inconsistent formatting. Extracting structured rates and quantities from Nigerian construction BOQs is not a weekend task.
+
+**What should be added:** For MVP, do not attempt automated parsing. Instead: (a) upload BOQ as a reference PDF viewable by the GUARDIAN agent, (b) require the developer or site manager to manually enter key contract rates and BOQ quantities into structured fields during budget setup. Automated parsing is a Phase 4 enhancement.
+
+---
+
+## 5. Usability Improvements
+
+Things a real user would notice that neither document addressed.
+
+### 5.1 Empty States
+
+Every view in the app will start empty. The PRD and plan describe fully populated dashboards but never address what the user sees on Day 1.
+
+- **Command Dashboard with zero leads:** Show a setup checklist ("✅ Project created → ⬜ First campaign launched → ⬜ First lead captured") instead of empty charts.
+- **Buyer Portal with no payments:** Show a clear "Your first payment is due on [date]. Here's how to pay." card, not an empty progress bar.
+- **GUARDIAN dashboard with no invoices:** Show "No invoices submitted yet. Here's how contractors submit invoices." with a link to share the Contractor Portal URL.
+
+### 5.2 Loading and Processing Feedback
+
+The GUARDIAN analysis takes up to 5 minutes. The WhatsApp response takes up to 60 seconds. The user needs to know something is happening.
+
+- When an invoice is submitted, show "GUARDIAN is analysing your invoice — you'll be notified when the report is ready" with a spinner or progress indicator.
+- When a lead form is submitted, show an immediate thank-you page. Don't make the user wait for the WhatsApp message to send.
+- When the developer approves an invoice, show "Payment Ticket generating..." with a confirmation toast when done.
+
+### 5.3 Error Messages for Humans
+
+Define a human-readable error message for every failure mode:
+- Claude API timeout: "Our AI assistant is temporarily busy. Your request has been queued and will be processed shortly."
+- WhatsApp send failure: "We couldn't reach this contact on WhatsApp. An email has been sent instead."
+- File upload too large: "This file is over 10MB. Please compress it or upload a smaller version."
+
+### 5.4 Mobile-First Site Manager Experience
+
+The site manager (Chukwudi) is on a construction site with a phone. His interface must be brutally simple:
+- Large tap targets, minimal typing, photo-first workflow.
+- Purchase request form: pre-populated dropdowns (not free-text) for common materials.
+- Progress update: camera opens directly, summary field uses voice-to-text.
+- Works offline and syncs when connectivity returns (or at minimum, doesn't lose draft data on network drop).
+
+### 5.5 Buyer Onboarding
+
+The buyer receives a WhatsApp message saying "your portal is ready." But the PRD doesn't address what happens when they click through for the first time.
+
+- First-time buyer portal login should show a 3-step welcome: "Welcome, Amaka. Here's your unit → Here's your payment schedule → Here's how to reach us."
+- Don't dump them on a full dashboard. Guide them.
+
+### 5.6 WhatsApp Conversation Quality Guardrails
+
+The PRESELL agent can send unlimited WhatsApp messages. But what if it loops, sends the same message twice, or sends a nonsensical response?
+
+- Implement a **message deduplication check**: if the agent generates a message identical to the last message sent, suppress it and log a warning.
+- Implement a **conversation rate limit**: maximum 3 agent-initiated messages per hour per lead. If the agent wants to send more, queue them.
+- Implement a **conversation length limit**: if a conversation exceeds 30 turns without advancing past QUALIFYING, auto-escalate to a human with the full thread.
+
+---
+
+## 6. Quality Improvements
+
+### 6.1 Structured Logging from Day 1
+
+Every Edge Function and agent call should log to a consistent schema:
+
+```
+{ timestamp, org_id, event_type, source (edge_function | agent | mcp), 
+  function_name, input_summary, output_summary, duration_ms, 
+  status (success | error | timeout), error_message? }
+```
+
+This is not in `agent_logs` — this is an `event_logs` table for operational monitoring. `agent_logs` is for AI reasoning audit. `event_logs` is for "did the system work."
+
+### 6.2 Graceful Degradation Chain
+
+Define the fallback behaviour when each external dependency fails:
+
+| Dependency | Failure | Fallback |
+|-----------|---------|----------|
+| Claude API | Timeout / 5xx | Retry 1x → OpenRouter → queue for retry in 5 min → log FAILED |
+| WhatsApp API | Rate limit / send failure | Retry 1x after 5s → email fallback via email-mcp → log to `failed_messages` |
+| Meta Ads API | Auth failure / rate limit | Skip sync cycle → alert super admin → retry next cycle |
+| Supabase Realtime | Connection drop | Frontend polls every 30s as fallback → reconnect on visibility change |
+| Supabase Storage | Upload failure | Retry 1x → show user "Upload failed, please try again" → do not silently drop |
+
+### 6.3 Input Validation Patterns
+
+Establish a shared validation layer used by both frontend (immediate feedback) and Edge Functions (server-side enforcement):
+
+- **Phone numbers:** Nigerian format (+234...) validated with libphonenumber
+- **Email:** RFC 5322 validation
+- **File uploads:** MIME type whitelist (image/jpeg, image/png, application/pdf), max size enforced server-side
+- **Currency amounts:** Integer-only (stored as kobo), no floating point
+- **Slugs:** lowercase alphanumeric + hyphens only, 3–30 chars, unique across `organisations`
+
+### 6.4 Rate Limiting on Public Endpoints
+
+The lead capture form and landing page are public. Without rate limiting:
+- A bot can submit 10,000 fake leads, each triggering a Claude API call + WhatsApp message.
+- Cost: ~₦500,000 in wasted API calls in one night.
+
+**Required:** Rate limit the `on-lead-created` Edge Function to 10 submissions per IP per hour. Duplicate phone/email submissions within 24h should update the existing lead, not create a new one.
+
+### 6.5 Idempotent Edge Functions
+
+Every Edge Function that processes webhooks (especially `on-whatsapp-inbound`) must be idempotent. WhatsApp's webhook delivers messages at least once — duplicate deliveries are common.
+
+**Required:** Store a `message_id` (from WhatsApp payload) in `whatsapp_threads` and reject duplicates at the Edge Function level before calling the agent.
+
+### 6.6 Database Indexing Strategy
+
+With `organisation_id` on every table and RLS filtering on every query, the following composite indexes must be created in Sprint 1:
+
+- `leads(organisation_id, status, score DESC)`
+- `invoices(organisation_id, status, submitted_at DESC)`
+- `payments_in(organisation_id, buyer_id, confirmed_at DESC)`
+- `whatsapp_threads(organisation_id, contact_phone, created_at DESC)`
+- `agent_logs(organisation_id, agent_type, created_at DESC)`
+
+Without these, dashboard queries will table-scan as data grows.
+
+---
+
+## 7. Value-Add Suggestions
+
+### QUICK WIN (< 1 day each)
+
+| # | Suggestion | Why It Matters |
+|---|-----------|---------------|
+| QW1 | **Approval via WhatsApp reply.** When the morning brief lists pending invoices, let the developer reply "Approve 1" or "Approve all" directly in WhatsApp. The agent parses the reply and calls `on-approval-granted`. | Cuts developer daily time from 15 min to 5 min. The #1 product promise is minimal developer time. |
+| QW2 | **Lead source badge on every lead card.** Show "📱 Meta · Diaspora UK · Creative A" as a coloured badge on the lead profile, not buried in a data field. | Makes attribution visible without navigating to a report. Sales agents see which leads are worth more. |
+| QW3 | **"Copy Payment Details" button for buyers.** On the Buyer Portal payment page, a single tap copies bank name + account number + reference code to clipboard. | Nigerian buyers pay via mobile banking. Copy-paste eliminates typos in reference codes (which cause reconciliation failures). |
+| QW4 | **WhatsApp delivery receipts visible to sales agents.** Show ✓ (sent), ✓✓ (delivered), 🔵 (read) status next to each message in the lead profile. | Sales agents know whether to follow up or wait. Sent but undelivered = phone issue, not disinterest. |
+| QW5 | **Org health score in Super Admin.** A single 0–100 score per org based on: active leads, payment collection rate, GUARDIAN flag resolution rate, agent error rate. | Platform operators see at a glance which clients need attention. |
+
+### FUTURE PHASE
+
+| # | Suggestion | Why It Matters |
+|---|-----------|---------------|
+| FP1 | **Buyer referral programme.** Each buyer gets a unique referral link. If their referral converts, the buyer gets a credit or discount on their next instalment. | Word-of-mouth is the most powerful sales channel in Nigerian real estate. The system already has attribution tracking — this extends it. |
+| FP2 | **Contractor bidding system.** For purchase requests above a threshold (e.g., ₦2M), allow 3 pre-qualified contractors to submit competing quotes within DEVOS. GUARDIAN compares all three. | Eliminates single-source bias. Developers see market rates in real time. |
+| FP3 | **Construction milestone notifications for buyers.** When a progress update shows a phase reaching 25%, 50%, 75%, 100% complete, automatically send the buyer a WhatsApp update with a photo. | Keeps buyers engaged and reduces "is my house being built?" support queries. Current system updates the portal but doesn't proactively notify. |
+| FP4 | **Developer mobile app (native).** The current plan includes a PWA. A native app (React Native) would enable push notifications for approval requests and hot leads, which is more reliable than WhatsApp for time-sensitive actions. | PWA push notifications are unreliable on iOS. The developer persona needs instant notification reliability. |
+| FP5 | **AI-powered BOQ parsing.** Use Claude to extract structured rates and quantities from uploaded BOQ PDFs. Review and confirm via UI before committing to DB. | Removes the manual data entry step from budget setup, which is the most tedious part of onboarding. |
+
+---
+
+## 8. Revised Assumptions & Open Questions
+
+These were assumed in the PRD or plan and must be confirmed with a specific answer before coding begins.
+
+| # | Question | Why It Matters | Default if No Answer |
+|---|---------|---------------|---------------------|
+| A1 | **Is the DEVOS Agent Engine a Supabase Edge Function, a standalone Node.js service, or something else?** | Determines hosting, scaling, cost model, and concurrency handling. This is the single most important architectural decision remaining. | Supabase Edge Function (stateless, per-invocation). |
+| A2 | **How are Supabase Auth roles assigned?** Custom claims in JWT? `org_members.role` column checked at app level? Supabase Auth metadata? | RLS policies depend on this. Every permission check flows from this decision. | `org_members.role` column, with `get_user_org_id()` and `get_user_role()` helper functions used in RLS. |
+| A3 | **Is Ollama on VPS in scope for MVP?** The PRD lists it for "lightweight classification/summarisation" but gives no specific use case. | If yes, it adds a VPS dependency. If no, all AI calls go to Claude API (simpler but more expensive). | Out of scope for MVP. All AI via Claude API + OpenRouter fallback. |
+| A4 | **What bank does Primerose use, and does it support webhooks for payment confirmation?** | If yes, semi-automated payment confirmation is possible. If no, manual finance confirmation is the only path. | Manual confirmation. No bank webhook for MVP. |
+| A5 | **Has legal review of document templates (Reservation Letter, Sale Agreement, Notice of Default) been initiated?** | These templates must be approved by a solicitor before pdf-mcp can generate them. Lead time is typically 2–4 weeks. | Must be initiated no later than Sprint 2 to be ready by Sprint 3 delivery. |
+| A6 | **What is the approved monthly budget for Claude API calls?** | Without a cost cap, a high-volume sales campaign could generate thousands of API calls per day. | Set an org-level monthly API cost ceiling with alerting at 80%. Recommended: ₦200,000/month for Primerose MVP. |
+| A7 | **Who is the approver for purchase requests vs invoices?** Is it always the developer (org_admin), or can it be delegated? | Affects the approval workflow and notification routing. | Developer (org_admin) only for MVP. Delegation is a Phase 4 feature. |
+| A8 | **Is the `[slug].devos.app` domain structure confirmed?** Or will Primerose use a custom domain (primerose.ng)? | Affects Vercel configuration, SSL, and DNS setup in Sprint 1. | `[slug].devos.app` for MVP. Custom domains in Phase 5 (Enterprise tier). |
+| A9 | **Is WhatsApp Business API tier already approved?** New WhatsApp Business accounts start with very low message limits (250/day). | A 200-unit project with active marketing could exceed this in Week 1. Business tier upgrade takes time. | Initiate WhatsApp Business verification now. Target Tier 2 (10,000 messages/day) before launch. |
+| A10 | **What is the data retention policy for WhatsApp conversations?** | Stored in DEVOS forever? Purged after 12 months? Legal implications for buyer disputes. | Retained for the duration of the project + 1 year. Legal review recommended. |
+
+---
+
+## 9. The Enhanced Summary Brief
+
+> **This section is the single source of truth for the build team.** Read this in 5 minutes and know exactly what you're building.
+
+---
+
+### What We're Building
+
+DEVOS is an AI-powered operating system for off-plan real estate developers. It has three modules:
+
+1. **PRESELL** — Runs paid ads, captures leads, qualifies them via WhatsApp AI conversation, converts to reservation, manages payment plans, provides a buyer portal.
+2. **GUARDIAN** — Monitors every purchase request and contractor invoice against market rates, BOQ, contracts, and site progress. Flags anomalies. Generates Payment Tickets. Produces JV partner reports.
+3. **COMMAND** — A single dashboard + daily WhatsApp brief. Developer spends <20 min/day.
+
+It is multi-tenant SaaS from Sprint 1. First client: Primerose Smart City Cluster (200 units, Rivers State).
+
+### The Architecture in One Paragraph
+
+React frontend on Vercel with wildcard subdomain routing (`[slug].devos.app`). Supabase backend: PostgreSQL with `organisation_id` on every table + RLS + Auth + Storage + Edge Functions. Supabase Edge Functions handle all deterministic events (lead created, invoice submitted, payment confirmed, scheduled reminders). When reasoning is needed, Edge Functions call the **DEVOS Agent Engine** — a stateless Claude API invocation scoped to one `organisation_id`, with MCP tools for WhatsApp, Meta Ads, email, and PDF generation. Per-org API credentials stored in Supabase Vault and injected at call time. OpenClaw (Law's personal AI) has read-only access to DEVOS data — it is not part of the product.
+
+### The Four Agents
+
+| Agent | Trigger | Core Behaviour | Tool Access |
+|-------|---------|---------------|-------------|
+| PRESELL | New lead, inbound WhatsApp | Multi-turn qualification, scoring, escalation | whatsapp-mcp, supabase-mcp |
+| GUARDIAN | Purchase request, invoice submitted, weekly JV trigger | Analysis against BOQ/contract/market rates, flag generation, report writing | supabase-mcp, email-mcp, pdf-mcp |
+| ADENGINE | Campaign setup, 48h optimisation cycle, ad fatigue detection | Performance analysis, budget reallocation, copy generation | meta-ads-mcp, tiktok-ads-mcp, veo3-mcp |
+| MASTER | Daily 7am trigger | Cross-module synthesis, morning brief composition | whatsapp-mcp, supabase-mcp |
+
+### Build Phases
+
+| Phase | Weeks | Delivers |
+|-------|-------|---------|
+| **1 — Foundation** | 1–3 | Multi-tenant schema, landing page, lead capture, WhatsApp qualification, reservation flow, Buyer Portal MVP, Command Dashboard MVP, morning brief |
+| **2 — GUARDIAN Core** | 4–6 | Budget setup, purchase request workflow, Contractor Portal, invoice verification, approval → Payment Ticket → finance chain, GUARDIAN dashboard, JV weekly report |
+| **3 — Intelligence** | 7–10 | AdEngine (campaigns, Meta Ads integration, creative approval, performance dashboard, 48h optimisation, attribution tracking), predictive overrun engine, full Command Dashboard |
+| **4 — Polish** | 11–14 | Sale Agreement generation, e-signature, Notice of Default, contractor scoring, error handling hardening, security audit, UAT, load testing |
+| **5 — SaaS** | Months 4–6 | Onboarding wizard, subscription billing (Paystack + Stripe), white-label, Super Admin panel, marketing site, first 3 external clients |
+
+### Critical Edge Cases That Must Be Handled
+
+| # | Edge Case | Where | How |
+|---|----------|-------|-----|
+| 1 | Duplicate lead submission (same phone/email within 24h) | `on-lead-created` | Upsert — update existing lead, do not create duplicate, do not trigger new WhatsApp thread |
+| 2 | WhatsApp webhook delivers same message twice | `on-whatsapp-inbound` | Check `message_id` against `whatsapp_threads`. Reject duplicate. |
+| 3 | Claude API timeout during WhatsApp conversation | Agent Engine | 30s timeout → OpenRouter fallback → if both fail, queue message for retry in 5 min, send buyer "Thanks, we'll get back to you shortly" template |
+| 4 | Two buyers attempt to reserve the same unit simultaneously | Reservation flow | Database-level: `SELECT FOR UPDATE` on the `units` row. First confirmed deposit wins. Second buyer is offered alternatives. |
+| 5 | Contractor submits invoice for a phase marked <50% complete by site manager | `on-invoice-submitted` | GUARDIAN flags as CRITICAL. Invoice blocked. Site manager asked to verify. |
+| 6 | Payment reference code typo (buyer sends wrong code) | Finance view | Finance can search by amount + date range + contractor name when reference doesn't match. System suggests best match. |
+| 7 | Org slug collision (two orgs want "primerose") | Org creation | Slug uniqueness enforced at DB level (unique constraint). UI shows "this name is taken" instantly. |
+| 8 | WhatsApp API rate limit exceeded | whatsapp-mcp | Queue excess messages. Process when rate limit resets. Alert super admin if queue exceeds 100 messages. |
+| 9 | Lead goes 30+ turns without progressing past QUALIFYING | PRESELL Agent | Auto-escalate to human. Mark lead as NEEDS_INTERVENTION. |
+| 10 | Exchange rate used in diaspora display is stale | Landing page / WhatsApp | Display "approximate rate as of [date]" disclaimer. Rate updated daily from a reliable API (e.g., exchangerate-api.com). |
+
+### What "Done" Looks Like (Phase 1)
+
+- [ ] A lead submits a form on `primerose.devos.app/buy` and receives a WhatsApp message within 60 seconds.
+- [ ] The AI conducts a multi-turn qualification conversation, updates the lead score after each turn.
+- [ ] When lead score hits 70+, the sales agent gets a notification with the full conversation thread.
+- [ ] A buyer can reserve a unit, receive payment instructions with a unique reference, upload a receipt.
+- [ ] Finance confirms the receipt. The unit status changes to "Reserved." The Buyer Portal activates. A Reservation Letter PDF is auto-generated and sent.
+- [ ] The Command Dashboard shows live unit counts, revenue, and lead pipeline.
+- [ ] The developer receives a morning brief at 7am via WhatsApp summarising overnight activity.
+- [ ] All data is isolated by `organisation_id`. A second org's data is invisible.
+
+### What "Done" Looks Like (Phase 2)
+
+- [ ] A site manager submits a purchase request. GUARDIAN analyses it within 5 minutes and flags price/quantity anomalies.
+- [ ] A contractor submits an invoice with evidence photos. GUARDIAN runs 6 checks and produces a flag report.
+- [ ] Developer approves → Payment Ticket generated → Finance notified by email.
+- [ ] Budget dashboard shows real-time spend vs plan with health indicators.
+- [ ] JV report auto-delivered every Monday at 7am.
+- [ ] Finance View shows all Payment Tickets pending and completed.
+
+### What "Done" Looks Like (Phase 3)
+
+- [ ] Developer creates a campaign in DEVOS. AdEngine generates copy variants. Developer approves. Ads go live on Meta.
+- [ ] Every lead is attributed to the specific ad creative that generated it.
+- [ ] AdEngine autonomously pauses underperformers and scales top performers every 48 hours.
+- [ ] GUARDIAN predicts budget overruns 6–8 weeks in advance and alerts the developer.
+- [ ] Revenue attribution report shows exact ROAS per ad, per audience, per platform.
+
+---
+
+### Test Coverage Map
+
+#### PRESELL Module
+
+| Feature | Unit Test | Integration Test | Top 3 Edge Cases |
+|---------|-----------|-----------------|-------------------|
+| Lead scoring algorithm | Test each signal (+15 Lagos, +20 diaspora, -20 below min price, etc.) with known inputs → assert exact score | Lead form → Supabase → score calculated → correct score stored | 1. All positive signals = max 100 (not >100). 2. All negative signals = min 0 (not negative). 3. Score recalculated correctly after WhatsApp engagement signals added. |
+| WhatsApp qualification flow | Test each state transition (INTAKE→QUALIFYING, QUALIFYING→HOT, etc.) with mock agent responses | Lead created → WhatsApp sent → reply received → agent responds → score updated → state changed | 1. Out-of-order messages (reply to Q1 arrives after Q2 sent). 2. Buyer sends media (photo/voice note) instead of text. 3. Conversation restarts after 48h silence (COLD re-entry). |
+| Reservation workflow | Test unit status transitions (Available→Reserved, Reserved→Sold) with constraint enforcement | Buyer selects unit → payment instructions sent → receipt uploaded → finance confirms → Buyer Portal active → PDF generated | 1. Two simultaneous reservations on same unit. 2. Receipt uploaded but finance rejects (unit returns to Available). 3. Buyer reserves then goes silent for 14 days (reservation expiry policy needed). |
+| Payment reminders | Test reminder trigger logic: 7d before, 3d before, due date, overdue escalation | Scheduled function fires → correct buyers identified → WhatsApp template sent → delivery confirmed | 1. Payment made between reminder schedule and send time (don't remind for paid instalments). 2. Buyer has no WhatsApp (fallback to email). 3. Multiple instalments overdue simultaneously (send one consolidated notice, not five). |
+
+#### GUARDIAN Module
+
+| Feature | Unit Test | Integration Test | Top 3 Edge Cases |
+|---------|-----------|-----------------|-------------------|
+| Purchase request analysis | Test price check (>5% flag), quantity check (>15% flag), budget check (>85% consumed flag), duplicate check (same item + supplier in 14d) | Site manager submits → Edge Function fires → GUARDIAN agent analyses → flags appear in developer dashboard | 1. Price exactly at 5% threshold (should it flag or not? Define: >5% flags). 2. Budget at 84.9% with new request pushing to 86% (flag, not block). 3. Two purchase requests for same material, different suppliers, same day (not a duplicate — different suppliers). |
+| Invoice verification | Test each of 6 checks in isolation: rate vs contract, progress vs site manager report, quantity vs BOQ, cumulative BOQ, photo analysis, duplicate detection | Contractor submits invoice with photos → Edge Function → GUARDIAN analysis → flags generated → site manager verification → developer approval → Payment Ticket | 1. Contractor submits invoice for work not yet in any progress_update (no data to compare against). 2. Cumulative invoiced amount exactly equals BOQ allowance (flag as INFO, not block). 3. Two invoices from same contractor, same amount, different work items (not a duplicate — verify by description). |
+| Approval → Payment Ticket | Test ticket PDF generation with correct fields, test finance email delivery | Developer approves → ticket created → PDF generated → email sent → finance marks PAID → budget updated | 1. Developer approves then immediately retracts (cancel Payment Ticket before finance processes). 2. Finance marks PAID but enters wrong amount (recording should match ticket amount, with option to note discrepancy). 3. Network failure during PDF generation (retry, don't leave approval in limbo). |
+
+#### AdEngine Module
+
+| Feature | Unit Test | Integration Test | Top 3 Edge Cases |
+|---------|-----------|-----------------|-------------------|
+| Campaign creation + Meta Ads publish | Test UTM link generation, test budget split calculation | Campaign created → creatives generated → developer approves → meta-ads-mcp publishes → ad_performance sync returns data | 1. Developer approves 0 of 3 generated creatives (campaign stays in DRAFT, nothing published). 2. Meta API rejects creative (wrong aspect ratio, policy violation) — surface error to developer with Meta's reason. 3. Campaign created with ₦0 budget (block at validation). |
+| 48h optimisation cycle | Test ad fatigue detection logic (CTR decline >30% over 7d), test budget reallocation rules | Scheduled trigger → agent analyses → pauses underperformers → scales top performer budget by ≤40% → logs decisions | 1. All ad sets underperforming (don't pause everything — keep the least-bad one running and alert developer). 2. Budget reallocation would exceed daily spend cap (cap at approved amount). 3. Meta API rate limited during optimisation (queue actions, retry next cycle). |
+| Lead attribution | Test attribution chain: ad_creative → lead → reservation → payments_in | Click tracking URL → lead form → lead created with source tag → reservation → attribution report shows revenue per creative | 1. Lead submits form organically (no UTM — attributed to "Direct/Organic"). 2. Lead clicks Ad A, then submits via Ad B link days later (last-click attribution — document this choice). 3. Lead converts but the original ad has been paused/deleted (attribution preserved, ad archived not deleted). |
+
+#### Cross-Module
+
+| Feature | Unit Test | Integration Test | Top 3 Edge Cases |
+|---------|-----------|-----------------|-------------------|
+| Morning brief | Test data compilation — correct lead count, payment total, flag count for a given org | 7am trigger → data snapshot → MASTER agent composes → WhatsApp sent to developer | 1. Zero overnight activity (brief should say "All clear — nothing requires your attention" not send an empty template). 2. Agent Engine fails during brief composition (send a fallback: "Morning brief generation failed. Check your dashboard."). 3. Multiple organisations (each developer gets only their org's brief, at their org's timezone). |
+| Multi-tenancy isolation | Test that RLS blocks cross-org read/write on every table | Create 2 orgs → insert data in org A → query as org B user → assert 0 rows returned; attempt write to org A row as org B user → assert error | 1. Service role key used without org_id parameter (must be blocked or logged as critical). 2. User moved from org A to org B (old org data immediately invisible). 3. Super admin impersonation mode (read-only flag must be enforced at DB level, not just UI). |
+
+---
+
+*This brief supersedes both the PRD v1.2 and Implementation Plan v1.0 as the working document for the build team. The PRD remains the authoritative requirements reference; the Implementation Plan remains the authoritative task breakdown. This brief fills the gaps between them.*

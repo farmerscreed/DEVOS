@@ -1,0 +1,359 @@
+# Prompt: Revise DEVOS Technical Architecture Document v1.0
+
+You previously produced the **DEVOS Technical Architecture Document v1.0**. That document has been through a Senior Architect review. Below are the **required revisions**, **answered clarification questions**, and **new architectural requirements** that must be incorporated into **v2.0** of the Technical Architecture.
+
+Do NOT produce a diff or summary. Produce the **complete, updated Technical Architecture Document v2.0** incorporating every change below. Where a change conflicts with the current document, the change below takes precedence.
+
+---
+
+## SECTION A: Three Critical Architecture Changes (P0 — Non-Negotiable)
+
+### A1. Replace Claude-Only Intelligence Layer with Multi-Model LLM Router (LiteLLM)
+
+The Intelligence Layer must NOT be hardcoded to Claude. Redesign it with a **model-agnostic abstraction layer using LiteLLM** as the routing/proxy service.
+
+**What LiteLLM provides:**
+- Unified OpenAI-compatible API across 100+ providers (Anthropic, OpenRouter, Google, Mistral, etc.)
+- Built-in fallback chains, retry logic, and load balancing
+- Per-request cost tracking (critical for per-org billing)
+- Streaming support
+- Can be self-hosted as a lightweight proxy alongside the Agent Engine worker
+
+**Update the Tech Stack table:**
+
+| Component | Old | New |
+|-----------|-----|-----|
+| LLM Primary | Claude Sonnet via Anthropic API | **LiteLLM Router** → routes to appropriate model per task |
+| LLM Fallback | OpenRouter (manual) | **Built into LiteLLM** (automatic fallback chains) |
+| LLM Local | Ollama (out of scope) | Keep deferred — LiteLLM supports it when ready |
+| Video Generation | `veo3-mcp` (Google Veo 3) | **`video-mcp`** wrapping **fal.ai** API |
+
+**Add this model routing table to the Intelligence Layer section:**
+
+| Agent / Task | Primary Model | Fallback Model | Rationale |
+|-------------|---------------|----------------|-----------|
+| PRESELL Agent (WhatsApp qualification) | Claude 3.5 Haiku (via Anthropic) | GPT-4o-mini (via OpenRouter) | Fast response needed, conversational quality, cost-effective |
+| GUARDIAN Agent (invoice analysis) | Claude Sonnet (via Anthropic) | GPT-4o (via OpenRouter) | Highest reasoning quality needed for financial decisions |
+| ADENGINE Agent (copy generation) | GPT-4o-mini (via OpenRouter) | Claude Haiku | Creative writing, cost-sensitive, high volume |
+| MASTER Agent (morning brief) | GPT-4o-mini (via OpenRouter) | Claude Haiku | Summarisation is simpler, cost-sensitive |
+| Lead scoring | Rule-based engine (NO LLM) | N/A | Deterministic — must NOT use an LLM |
+| Photo analysis (GUARDIAN) | GPT-4o Vision (via OpenRouter) | Claude Vision | Multi-modal capability needed |
+| Video generation | fal.ai | None | Replaces Veo3 — more accessible API, better pricing |
+| Ad copy variants | GPT-4o-mini | Claude Haiku | High volume, cost-sensitive |
+
+**Add this new table to the Data Models section:**
+
+```sql
+CREATE TABLE llm_config (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organisation_id UUID REFERENCES organisations(id),
+  task_type TEXT NOT NULL, -- 'presell', 'guardian', 'adengine', 'master', 'photo_analysis', 'video_gen'
+  primary_provider TEXT NOT NULL, -- 'anthropic', 'openrouter', 'fal_ai'
+  primary_model TEXT NOT NULL, -- e.g. 'claude-3-5-haiku-20241022', 'gpt-4o-mini'
+  fallback_provider TEXT,
+  fallback_model TEXT,
+  max_tokens INTEGER DEFAULT 4096,
+  temperature NUMERIC DEFAULT 0.7,
+  monthly_budget_kobo INTEGER, -- per-org per-task cost cap
+  created_at TIMESTAMPTZ DEFAULT now(),
+  UNIQUE(organisation_id, task_type)
+);
+```
+
+**Add these columns to `agent_logs`:**
+- `model_used TEXT` — which model actually handled the request
+- `input_tokens INTEGER`
+- `output_tokens INTEGER`
+- `cost_usd NUMERIC`
+- `provider TEXT` — 'anthropic', 'openrouter', 'fal_ai', etc.
+
+**Update the architecture diagram** to show LiteLLM between the Agent Engine and the model providers. The Agent Engine calls LiteLLM, LiteLLM routes to the appropriate provider.
+
+**Update all references** from "Claude Sonnet (Anthropic API)" to "LiteLLM Router → [appropriate model per task]" throughout the document.
+
+**Per-org LLM cost caps:**
+
+| Plan Tier | Monthly LLM Budget |
+|-----------|-------------------|
+| Starter | ₦50,000/month |
+| Growth | ₦200,000/month |
+| Enterprise | ₦500,000/month (soft cap, alerting) |
+
+Add 80% alert threshold for each tier.
+
+---
+
+### A2. Move Agent Engine OFF Supabase Edge Functions
+
+Supabase Edge Functions have a **150-second timeout** and **150MB memory limit**. A GUARDIAN Agent invocation with multiple LLM calls and 6 analysis checks will routinely exceed this.
+
+**New architecture:**
+- **Supabase Edge Functions** remain for deterministic event routing (on-lead-created, webhooks, payment reminders, etc.) — unchanged
+- **Agent Engine Worker** is a separate service deployed on **Railway, Fly.io, or a dedicated Vercel Serverless Function (Pro Plan, 300s timeout)**
+- Edge Functions **dispatch** agent work to the worker via a queue (Supabase `agent_queue` table or a simple HTTP call to the worker endpoint)
+- The worker runs the LiteLLM-powered agent loop with no timeout constraints
+
+**Add `agent_queue` table to schema:**
+
+```sql
+CREATE TABLE agent_queue (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  organisation_id UUID REFERENCES organisations(id) NOT NULL,
+  agent_type TEXT NOT NULL, -- 'presell', 'guardian', 'adengine', 'master'
+  payload JSONB NOT NULL, -- context, trigger data
+  status TEXT DEFAULT 'pending', -- 'pending', 'processing', 'completed', 'failed'
+  attempts INTEGER DEFAULT 0,
+  max_attempts INTEGER DEFAULT 3,
+  result JSONB,
+  error_message TEXT,
+  created_at TIMESTAMPTZ DEFAULT now(),
+  started_at TIMESTAMPTZ,
+  completed_at TIMESTAMPTZ
+);
+```
+
+**Update the build sequence:** Add "Agent Engine Worker setup" as a Sprint 1 task (T1.14 replacement).
+
+**Update the Tech Stack table:**
+
+| Component | Old | New |
+|-----------|-----|-----|
+| AI Agent System | Supabase Edge Function (stateless, per-invocation) | **Agent Engine Worker** (Railway/Fly.io) + Supabase Edge Function dispatcher |
+
+---
+
+### A3. Fix `get_user_org_id()` for Multi-Org Users
+
+The current helper:
+```sql
+SELECT organisation_id FROM org_members WHERE user_id = $1;
+```
+Returns ALL organisations a user belongs to. This breaks RLS for users in multiple orgs (contractors working for two developers, super_admins).
+
+**Fix:** Use a custom JWT claim for active organisation. Replace the function with:
+
+```sql
+CREATE OR REPLACE FUNCTION get_active_org_id()
+RETURNS UUID AS $$
+  SELECT (auth.jwt() -> 'app_metadata' ->> 'active_organisation_id')::UUID;
+$$ LANGUAGE sql STABLE;
+```
+
+Add an RPC function to set active org at login/org-switch:
+
+```sql
+CREATE OR REPLACE FUNCTION set_active_organisation(target_org_id UUID)
+RETURNS VOID AS $$
+BEGIN
+  -- Verify user is member of target org
+  IF NOT EXISTS (
+    SELECT 1 FROM org_members
+    WHERE user_id = auth.uid() AND organisation_id = target_org_id
+  ) THEN
+    RAISE EXCEPTION 'Not a member of this organisation';
+  END IF;
+
+  -- Update JWT custom claim
+  UPDATE auth.users
+  SET raw_app_meta_data = raw_app_meta_data || jsonb_build_object('active_organisation_id', target_org_id)
+  WHERE id = auth.uid();
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+```
+
+**Update ALL RLS policies** to use `get_active_org_id()` instead of `get_user_org_id(auth.uid())`.
+
+**Add org-switcher to frontend** for users with multiple org memberships.
+
+---
+
+## SECTION B: Messaging Channel Abstraction (P1 — Add Telegram Support)
+
+The architecture must NOT hardcode WhatsApp as the only messaging channel. Design a **messaging channel abstraction** so that WhatsApp and Telegram are pluggable implementations behind a common interface.
+
+**Rationale:**
+- Telegram is free (no per-message cost vs WhatsApp Business API charges)
+- Telegram bot setup is instant (no 2-4 week verification)
+- Popular among Nigerian diaspora in UK/Canada
+- Inline keyboards are perfect for approval workflows
+
+**Architecture:**
+
+```
+messaging/
+├── channel_interface.ts    ← send_text(), send_media(), send_template(), on_inbound()
+├── whatsapp_channel.ts     ← WhatsApp Business API implementation (Sprint 1)
+├── telegram_channel.ts     ← Telegram Bot API implementation (Phase 2/3)
+└── channel_router.ts       ← Routes by lead's preferred channel or org config
+```
+
+**Schema changes:**
+- Rename `whatsapp_threads` → `message_threads`
+- Add `channel TEXT NOT NULL DEFAULT 'whatsapp'` column to `message_threads`
+- Add `preferred_channel TEXT DEFAULT 'whatsapp'` to `leads` table
+- Add `enabled_channels TEXT[] DEFAULT '{whatsapp}'` to `organisations` table
+
+**MCP Layer:**
+- Rename `whatsapp-mcp` to keep it, but add `telegram-mcp` as a second implementation
+- Both are called via the `channel_router` based on lead/org preference
+
+**Build sequence:**
+- Sprint 1: Build channel interface + WhatsApp implementation (no extra effort vs current plan)
+- Phase 2 or 3: Add `telegram-mcp` and Telegram channel implementation
+- Per-org config: orgs choose which channels to enable in Settings
+
+**Update ALL references** throughout the document: "WhatsApp" should become "messaging channel (WhatsApp/Telegram)" where referring to the system capability, or specify the specific channel where it's channel-specific.
+
+---
+
+## SECTION C: PRD Coverage Fixes (P1)
+
+Fix these gaps between the PRD and the Technical Architecture:
+
+### C1. Evidence Requirements (CRITICAL)
+Replace "6 evidence photos" with the PRD's actual 5-type evidence model:
+- Before Photos (min 2)
+- After/Completion Photos (min 3)
+- Delivery Receipt (signed delivery note)
+- Work Completion Certificate (site manager signature)
+- Measurement Certificate (for labour invoices)
+
+Update the `invoices` table schema to reflect these as separate typed fields, not just `evidence_urls[]`.
+
+### C2. Separation of Duties
+Add enforcement: the person who submits a purchase request CANNOT be the person who approves it. Enforce at RLS or application level:
+```sql
+-- In on-approval-granted Edge Function:
+IF purchase_requests.requested_by = approvals.actor_id THEN
+  REJECT with "Submitter cannot approve their own request"
+END IF;
+```
+
+### C3. Auto-Approve / Auto-Reject for Purchase Requests
+Add the PRD's GUARDIAN decision outcomes:
+- **Auto-Approve (Low Risk):** All checks pass, within budget, price within market range → advance to payment without developer review
+- **Auto-Reject (Block):** Price >30% above market OR would breach budget ceiling → reject automatically
+- These are configurable per-org (some developers may want manual review of everything)
+
+### C4. Google Display & YouTube Ads
+Add to the plan as **deferred to Phase 4**. Add a note: "Google Ads MCP (`google-ads-mcp`) is planned for Phase 4. Phase 3 focuses on Meta and TikTok. YouTube video ads can be published via Meta Ads Manager in the interim."
+
+### C5. Buyer Portal Support Chat
+Add routing logic for the "Support Chat" section in Buyer Portal (PRD §5.2.5). Route via the messaging channel abstraction (WhatsApp or Telegram). Tag inbound messages as `source: buyer_portal` to differentiate from lead qualification conversations.
+
+### C6. Billing Provider
+**Decision: Use Stripe for international payments (not Flutterwave).** Stripe has better API, broader currency support, and is the standard for SaaS. Update the PRD reference to match. Paystack remains for Nigerian naira.
+
+### C7. Handover Certificate
+Add `handover_certificate` to the `documents.document_type` enum. Triggered when site manager marks a unit phase as 100% complete and org_admin confirms handover.
+
+---
+
+## SECTION D: Security Fixes (P1-P2)
+
+### D1. Add reCAPTCHA v3 to Lead Capture Form
+The public lead form has no bot protection. Add invisible reCAPTCHA v3 (no UX friction). Validate score server-side in `on-lead-created` Edge Function. Reject submissions with score < 0.3.
+
+### D2. Define CORS Policy
+All Edge Functions must restrict `Access-Control-Allow-Origin` to `*.devos.app` only. No wildcard `*`.
+
+### D3. Service Role Safety
+The Agent Engine Worker uses a service role key (bypasses RLS). Add mandatory org_id validation:
+- Agent Worker MUST receive `organisation_id` from the dispatch context (Edge Function)
+- Agent Worker MUST NOT accept `organisation_id` from the LLM output
+- Add a guard function that validates org_id on every DB operation before executing
+
+### D4. Credential Health Checks
+Add a daily scheduled Edge Function `credential-health-check`:
+- Tests each org's stored credentials (WhatsApp token validity, Meta token expiry, etc.)
+- Updates `org_credentials.last_verified_at` and `org_credentials.status` ('valid', 'expiring', 'expired')
+- Alerts org_admin when credentials are near expiry or invalid
+
+### D5. Magic Link Security
+Replace predictable UTM codes (e.g., `META-DIA-A`) with UUID-based tokens (e.g., `a3f82b1c-...`). Store the mapping in a `tracking_links` table. This prevents enumeration attacks.
+
+---
+
+## SECTION E: Sequencing Fixes
+
+### E1. Fix Missing Dependencies
+Update Sprint 1 task dependencies:
+- T1.12 (`on-lead-created`) depends on T1.14 (Agent Engine Worker) — add this dependency
+- T1.14 (Agent Engine Worker) depends on T1.2/T1.3 (schema for `agent_logs`, `agent_context`) — add this dependency
+- T1.14 depends on T1.11 (`whatsapp-mcp`) to be able to act — add this dependency
+
+### E2. Add email-mcp to Sprint 1
+Move `email-mcp` build to Sprint 1. It's needed in Sprint 5 (finance notification) and Sprint 6 (JV reports), but Resend API is simple enough to build alongside `whatsapp-mcp`. Having it early enables useful notifications from Sprint 2 onwards.
+
+### E3. Add Sprint 1 Integration Smoke Test
+Add a new task to Sprint 1: **T1.18 — Agent Engine Integration Smoke Test.** Verify the full chain: Edge Function → Agent Queue → Agent Worker → LiteLLM → LLM → MCP tool call → DB write → result returned. Must pass before Sprint 2 begins.
+
+### E4. Legal Template Review — Start Immediately  
+Add a note: Legal template review for Reservation Letter, Sale Agreement, and Notice of Default must be initiated NOW (Week 0). Lead time is 2-4 weeks. Sprint 3 requires a completed Reservation Letter template. This is on the critical path.
+
+### E5. WhatsApp Business API Verification — Start Immediately
+Add a note: WhatsApp Business API Tier 2 verification (10K messages/day) must be initiated NOW. Verification takes 2-4 weeks and is required before production launch.
+
+---
+
+## SECTION F: Scope Reduction (Redirect Effort)
+
+Defer the following from Phase 3 to Phase 4:
+- **TikTok Ads MCP** — Meta is the primary platform. TikTok can reuse 90% of meta-ads-mcp patterns later. (~3-4 days saved)
+- **Full Predictive Overrun Engine** — Not enough historical data at Week 7. Ship a simple "burn rate vs remaining budget" calculation in Phase 3, label it "Early Warning". Full predictions in Phase 4. (~3-4 days saved)
+- **Contractor Performance Scoring** — No contractors will have enough invoices for meaningful scoring by Week 6. Track raw data now, score later. (~1-2 days saved)
+- **Lookalike Audience Builder** — Requires significant confirmed buyer data. At Week 8, sample size is too small. (~1-2 days saved)
+
+Redirect the ~10-15 days saved toward:
+- LiteLLM integration and multi-model routing setup
+- Agent Engine Worker service deployment
+- Messaging channel abstraction
+- More thorough RLS testing
+- Comprehensive E2E testing
+
+---
+
+## SECTION G: Answered Clarification Questions
+
+Incorporate these decisions into the document (replace "Open Questions" entries):
+
+| # | Question | Decision |
+|---|----------|----------|
+| Q1 | Flutterwave or Stripe for international? | **Stripe.** Better API, broader currency support, SaaS standard. |
+| Q2 | Per-org LLM cost cap? | Starter: ₦50K/month. Growth: ₦200K/month. Enterprise: ₦500K/month (soft cap). 80% alert threshold. |
+| Q3 | Can a user belong to multiple orgs? | **Yes.** Contractors and super_admins can. Use JWT active-org claim + org-switcher UI. |
+| Q4 | Credentials expire/invalid? | Agent operations for that org degrade gracefully. Daily health check alerts org_admin. Critical: agents stop for that org with clear error. |
+| Q5 | Who creates document templates? | Lawyer creates templates. Loaded manually into Supabase Storage per-org. DEVOS generates documents FROM templates, never creates legal language. |
+| Q6 | Google Ads MCP needed for MVP? | **Deferred to Phase 4.** Phase 3 focuses on Meta (+ TikTok deferred to Phase 4 as well). |
+| Q7 | Retry budget for agent failures? | **3 attempts max.** Primary model → fallback model → queue for retry in 5 min → on 3rd failure: log as FAILED, send alert to super_admin, send fallback message to user ("temporarily unavailable"). |
+| Q8 | fal.ai vs Veo3? | **fal.ai.** More accessible API, better pricing, proven reliability. Rename `veo3-mcp` to `video-mcp`. |
+| Q9 | Scheduled functions per-org timezone? | Each org has a `timezone` field on the `organisations` table. Scheduled Edge Functions query for orgs where `now() AT TIME ZONE org.timezone` matches the target time (e.g., 7:00 AM local). |
+| Q10 | WhatsApp Business API tier verified? | **Must be initiated immediately (Week 0).** Verification takes 2-4 weeks. Target: Tier 2 (10K messages/day) before production launch. |
+
+---
+
+## SECTION H: Additional Edge Cases to Document
+
+Add these to the Edge Cases & Error Handling section:
+
+1. **Agent infinite tool loop:** Hard cap at 10 tool calls per agent invocation. Exceeded → fail gracefully → log → alert super_admin.
+2. **Morning brief exceeds WhatsApp 4096-char limit:** Truncate to top 5 items per category, add "See dashboard for full details" link.
+3. **iPhone HEIC photo uploads:** Accept HEIC, convert server-side to JPEG on upload. Or reject with clear "supported formats: JPEG, PNG, PDF" message.
+4. **Stale exchange rate for diaspora pricing:** Cache last-known rate with timestamp. Display "Rate as of [date]". Block transactions if rate is >24h stale.
+5. **Partial PDF generation:** Generate to temp storage, validate completeness, then move to permanent storage. Never serve partial PDFs.
+6. **Concurrent approval + payment processing:** Optimistic locking on `payment_tickets.status`. Finance must verify ticket is still PENDING before marking PAID.
+7. **Organisation slug collisions:** Check against reserved/confusable list. Prevent visually similar slugs (e.g., "primerose" vs "prime-rose").
+8. **User in multiple organisations:** Login loads org-switcher if user has >1 membership. All subsequent requests scoped to active org via JWT claim.
+
+---
+
+## Final Instructions
+
+1. Produce the **complete** Technical Architecture Document v2.0 — not a diff or patch.
+2. Update version number to **2.0** and date to **March 2026**.
+3. Update ALL architecture diagrams to reflect: LiteLLM Router, Agent Engine Worker (separate from Edge Functions), messaging channel abstraction, fal.ai for video.
+4. Update ALL references from "Claude Sonnet" to the appropriate model per the routing table.
+5. Update ALL references from "whatsapp_threads" to "message_threads".
+6. Move resolved questions from "Open Questions" to "Resolved Decisions" section.
+7. Ensure the Build Sequence reflects the sequencing fixes (new dependencies, email-mcp in Sprint 1, smoke test task, deferred Phase 3 items).
+8. Keep the same level of detail and formatting quality as v1.0. Do not truncate or summarise existing content that doesn't need changing.
