@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
-import { supabase } from './supabase'
-import { useAppStore } from './store'
+import { supabase } from '../lib/supabase'
+import { useAppStore } from '../lib/store'
 
 export interface Organisation {
   id: string
@@ -24,13 +24,13 @@ export function useOrganisationFromSubdomain() {
         // Get subdomain from hostname
         const hostname = window.location.hostname
         console.log('Current hostname:', hostname)
-        
+
         // Handle localhost or no subdomain
         if (hostname === 'localhost' || hostname === '127.0.0.1') {
           // For localhost, use a default org or query param
           const params = new URLSearchParams(window.location.search)
           const slug = params.get('org') || 'primerose'
-          
+
           const { data, error } = await supabase
             .from('organisations')
             .select('*')
@@ -46,12 +46,12 @@ export function useOrganisationFromSubdomain() {
         // Extract subdomain (e.g., "primerose" from "primerose.devos.app")
         const parts = hostname.split('.')
         let slug = parts[0]
-        
+
         // If on vercel.app or localhost, handle accordingly
         if (parts.length >= 2 && parts[parts.length - 2] === 'vercel') {
           slug = parts[0] // This would be preview deployment
         }
-        
+
         // For devos.app subdomains
         if (parts.length >= 3 && parts[parts.length - 2] === 'devos') {
           slug = parts[0]
@@ -73,7 +73,7 @@ export function useOrganisationFromSubdomain() {
             .select('*')
             .limit(1)
             .single()
-          
+
           if (fallbackData) {
             setOrganisation(fallbackData)
             setOrgInStore(fallbackData)
