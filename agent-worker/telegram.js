@@ -148,6 +148,7 @@ async function handleInboundMessage(orgId, orgName, bot, msg) {
 
     let leadId = null;
     let leadName = msg.from.first_name || 'User';
+    let isNewLead = false;
 
     if (!lead) {
         console.log(`[Telegram] Creating new lead for chatId ${chatId}`);
@@ -157,10 +158,12 @@ async function handleInboundMessage(orgId, orgName, bot, msg) {
                 organisation_id: orgId,
                 name: leadName,
                 phone: pseudoPhone,
+                telegram_chat_id: String(chatId),
                 preferred_channel: 'telegram',
                 status: 'new',
                 score: 30, // base score
-                category: 'cold'
+                category: 'cold',
+                conversation_state: 'intake'
             })
             .select()
             .single();
@@ -170,12 +173,16 @@ async function handleInboundMessage(orgId, orgName, bot, msg) {
             return;
         }
         leadId = newLead.id;
+        isNewLead = true;
     } else {
         leadId = lead.id;
         leadName = lead.name;
         // Update preferred channel if not already
         if (lead.preferred_channel !== 'telegram') {
-            await supabase.from('leads').update({ preferred_channel: 'telegram' }).eq('id', leadId);
+            await supabase.from('leads').update({
+                preferred_channel: 'telegram',
+                telegram_chat_id: String(chatId)
+            }).eq('id', leadId);
         }
     }
 
@@ -193,8 +200,14 @@ async function handleInboundMessage(orgId, orgName, bot, msg) {
 
     // 3. Dispatch to agent_queue
     const sysPrompt = `You are a real estate agent for ${orgName}. The user is messaging you on Telegram. \n` +
-        `Ask qualifying questions smoothly: budget, timeline, investment type, unit preference. ` +
+        `Ask qualifying questions smoothly: budget, timeline, investment type, unit preference. \n` +
         `Important: when sending a message to the user, use the 'send_telegram_message' tool and pass the chat_id: "${chatId}".`;
+
+    // Get conversation turns for this lead
+    const { count: turns } = await supabase
+        .from('message_threads')
+        .select('*', { count: 'exact', head: true })
+        .eq('lead_id', leadId);
 
     await supabase
         .from('agent_queue')
@@ -206,12 +219,17 @@ async function handleInboundMessage(orgId, orgName, bot, msg) {
             max_attempts: 3,
             lead_id: leadId,
             payload: {
-                action: 'inbound_reply',
+                action: isNewLead ? 'new_lead_greeting' : 'inbound_reply',
                 lead_name: leadName,
                 lead_phone: pseudoPhone,
                 chat_id: String(chatId),
                 content: text,
-                messages: [
+                conversation_turns: turns || 0,
+                channel: 'telegram',
+                messages: isNewLead ? [
+                    { role: 'system', content: sysPrompt },
+                    { role: 'user', content: `New lead ${leadName} (${pseudoPhone}) has just started a conversation. Send a warm greeting and introduce yourself. Ask how you can help.` }
+                ] : [
                     { role: 'system', content: sysPrompt },
                     { role: 'user', content: `User ${leadName} says: "${text}"\nPlease respond passing chat_id="${chatId}".` }
                 ]
@@ -224,15 +242,91 @@ async function handleInboundMessage(orgId, orgName, bot, msg) {
 async function sendOutboundTelegram(orgId, chatId, text) {
     const bot = activeBots.get(orgId);
     if (!bot) {
-        throw new Error(`[Telegram] No active bot for org ${orgId}`);
+        // Fallback: use raw Telegram API with bot token from org_credentials
+        const { data: cred } = await supabase
+            .from('org_credentials')
+            .select('credentials')
+            .eq('organisation_id', orgId)
+            .eq('provider', 'telegram')
+            .eq('status', 'active')
+            .single();
+        if (!cred) throw new Error(`[Telegram] No active bot for org ${orgId}`);
+        const token = cred.credentials?.bot_token || JSON.parse(cred.credentials || '{}').bot_token;
+        if (!token) throw new Error(`[Telegram] No bot token for org ${orgId}`);
+        const https = require('https');
+        const body = JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' });
+        return new Promise((resolve, reject) => {
+            const req = https.request({
+                hostname: 'api.telegram.org',
+                path: `/bot${token}/sendMessage`,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+            }, (res) => {
+                let d = '';
+                res.on('data', c => d += c);
+                res.on('end', () => resolve(JSON.parse(d)));
+            });
+            req.on('error', reject);
+            req.write(body);
+            req.end();
+        });
     }
-
-    await bot.sendMessage(chatId, text);
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
     console.log(`[Telegram] Outbound message sent to ${chatId}`);
     return { success: true, channel: 'telegram', chatId };
 }
 
+/**
+ * Send a photo to a Telegram chat by URL (T2.6 media library)
+ */
+async function sendOutboundTelegramPhoto(orgId, chatId, photoUrl, caption = '') {
+    const bot = activeBots.get(orgId);
+    if (!bot) throw new Error(`[Telegram] No active bot for org ${orgId}`);
+    await bot.sendPhoto(chatId, photoUrl, { caption });
+    console.log(`[Telegram] Photo sent to ${chatId}: ${photoUrl}`);
+    return { success: true, channel: 'telegram', chatId, photoUrl };
+}
+
+/**
+ * Send a document/file to a Telegram chat by URL (T2.6 media library)
+ */
+async function sendOutboundTelegramDocument(orgId, chatId, fileUrl, caption = '') {
+    const bot = activeBots.get(orgId);
+    if (!bot) throw new Error(`[Telegram] No active bot for org ${orgId}`);
+    await bot.sendDocument(chatId, fileUrl, { caption });
+    console.log(`[Telegram] Document sent to ${chatId}: ${fileUrl}`);
+    return { success: true, channel: 'telegram', chatId, fileUrl };
+}
+
+/**
+ * Get admin/sales agent Telegram chat IDs for an org (T2.5 hot lead alerts)
+ * Reads notification_chat_ids from the telegram org_credentials entry
+ */
+async function getAdminChatIds(orgId) {
+    const { data: cred } = await supabase
+        .from('org_credentials')
+        .select('credentials')
+        .eq('organisation_id', orgId)
+        .eq('provider', 'telegram')
+        .eq('status', 'active')
+        .single();
+
+    if (!cred) return [];
+
+    let parsed = cred.credentials;
+    if (typeof parsed === 'string') {
+        try { parsed = JSON.parse(parsed); } catch { return []; }
+    }
+
+    // notification_chat_ids can be a single ID string or array of IDs
+    const ids = parsed?.notification_chat_ids || [];
+    return Array.isArray(ids) ? ids : [ids];
+}
+
 module.exports = {
     startTelegramBots,
-    sendOutboundTelegram
+    sendOutboundTelegram,
+    sendOutboundTelegramPhoto,
+    sendOutboundTelegramDocument,
+    getAdminChatIds
 };

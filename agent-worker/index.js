@@ -306,41 +306,38 @@ async function handleHotLeadNotification(orgId, leadId, oldScore, newScore) {
             .update({ status: 'contacted' })
             .eq('id', leadId);
 
-        // Find sales agents in the organisation
-        const { data: agents } = await supabase
+        // Find all org members to create in-app notifications
+        const { data: members } = await supabase
             .from('org_members')
-            .select('user_id, users(email, raw_user_meta_data)')
-            .eq('organisation_id', orgId)
-            .eq('role', 'sales_agent');
+            .select('user_id')
+            .eq('organisation_id', orgId);
 
-        // Create notifications for agents and send Telegram alerts
-        if (agents && agents.length > 0) {
-            const notifications = agents.map(agent => ({
+        if (members && members.length > 0) {
+            const notifications = members.map(m => ({
                 organisation_id: orgId,
-                user_id: agent.user_id,
+                user_id: m.user_id,
                 type: 'lead_hot',
                 title: '🔥 Hot Lead Alert!',
-                message: `${lead.name} has been qualified as a HOT lead (Score: ${newScore}). Immediate follow-up recommended!`,
+                message: `${lead.name} has reached HOT status (Score: ${newScore}). Immediate follow-up recommended!`,
                 data: { lead_id: leadId, lead_name: lead.name, score: newScore }
             }));
+            await supabase.from('notifications').insert(notifications).then(({ error }) => {
+                if (error) console.warn('[HotLead] Notification insert failed:', error.message);
+            });
+        }
 
-            await supabase.from('notifications').insert(notifications);
-
-            // Send Telegram alert to each sales agent who has a Telegram chat ID
-            const { sendOutboundTelegram } = require('./telegram');
-            for (const agent of agents) {
-                const agentMeta = agent.users?.raw_user_meta_data || {};
-                if (agentMeta.telegram_chat_id) {
-                    try {
-                        await sendOutboundTelegram(
-                            orgId,
-                            agentMeta.telegram_chat_id,
-                            `🔥 *Hot Lead Alert!*\n\n*${lead.name}* just hit score ${newScore}/100.\n\nImmediate follow-up recommended!\n\nLead ID: ${leadId}`
-                        );
-                    } catch (e) {
-                        console.error('[HotLead] Failed to send Telegram alert to agent:', e.message);
-                    }
-                }
+        // Send Telegram alerts to admin chat IDs stored in org_credentials.credentials.notification_chat_ids
+        const { getAdminChatIds, sendOutboundTelegram } = require('./telegram');
+        const adminChatIds = await getAdminChatIds(orgId);
+        for (const chatId of adminChatIds) {
+            try {
+                await sendOutboundTelegram(
+                    orgId,
+                    chatId,
+                    `🔥 *Hot Lead Alert!*\n\n*${lead.name}* just hit score ${newScore}/100.\n\nImmediate follow-up recommended!\n\nLead ID: \`${leadId}\``
+                );
+            } catch (e) {
+                console.error('[HotLead] Failed to send Telegram alert:', e.message);
             }
         }
     }
@@ -754,6 +751,22 @@ function defineAgentTools(agentType) {
                     required: ['bucket']
                 }
             }
+        },
+        {
+            type: 'function',
+            function: {
+                name: 'send_telegram_photo',
+                description: 'Send a property photo or media file to a lead via Telegram using a public URL',
+                parameters: {
+                    type: 'object',
+                    properties: {
+                        chat_id: { type: 'string', description: 'Telegram chat ID' },
+                        photo_url: { type: 'string', description: 'Public URL of the photo/image to send' },
+                        caption: { type: 'string', description: 'Optional caption for the photo' }
+                    },
+                    required: ['chat_id', 'photo_url']
+                }
+            }
         }];
     }
 
@@ -794,6 +807,9 @@ async function executeTool(toolCall, orgId, job) {
 
         case 'send_telegram_message':
             return await sendTelegramMessage(orgId, params.chat_id, params.message);
+
+        case 'send_telegram_photo':
+            return await sendTelegramPhoto(orgId, params.chat_id, params.photo_url, params.caption);
 
         case 'update_lead_score':
             return await updateLeadScore(orgId, params.lead_id, params.score, params.category);
@@ -855,6 +871,11 @@ async function sendWhatsAppMessage(orgId, phone, message) {
 async function sendTelegramMessage(orgId, chatId, message) {
     const { sendOutboundTelegram } = require('./telegram');
     return await sendOutboundTelegram(orgId, chatId, message);
+}
+
+async function sendTelegramPhoto(orgId, chatId, photoUrl, caption = '') {
+    const { sendOutboundTelegramPhoto } = require('./telegram');
+    return await sendOutboundTelegramPhoto(orgId, chatId, photoUrl, caption);
 }
 
 async function updateLeadScore(orgId, leadId, score, category) {
