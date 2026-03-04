@@ -1,0 +1,11 @@
+{
+    "buildCommand": "cd devos-frontend && npm install && npm run build",
+    "outputDirectory": "devos-frontend/dist",
+    "installCommand": "echo skip",
+    "rewrites": [
+        {
+            "source": "/(.*)",
+            "destination": "/index.html"
+        }
+    ]
+}
