@@ -112,9 +112,9 @@ function Overview() {
                 .select('category')
             if (data) {
                 const total = data.length
-                const hot = data.filter((l) => l.category === 'hot').length
-                const warm = data.filter((l) => l.category === 'warm').length
-                const cold = data.filter((l) => l.category === 'cold').length
+                const hot = data.filter((l: any) => l.category === 'hot').length
+                const warm = data.filter((l: any) => l.category === 'warm').length
+                const cold = data.filter((l: any) => l.category === 'cold').length
                 setStats({ total, hot, warm, cold })
             }
         }
@@ -159,6 +159,20 @@ export default function Dashboard() {
     const { user, loading, signOut } = useAuth()
     const org = useAppStore((s) => s.organisation)
 
+    const [email, setEmail] = useState('')
+    const [password, setPassword] = useState('')
+    const [authError, setAuthError] = useState<string | null>(null)
+    const [isSigningIn, setIsSigningIn] = useState(false)
+
+    const handleSignIn = async (e: React.FormEvent) => {
+        e.preventDefault()
+        setAuthError(null)
+        setIsSigningIn(true)
+        const { error } = await supabase.auth.signInWithPassword({ email, password })
+        if (error) setAuthError(error.message)
+        setIsSigningIn(false)
+    }
+
     if (loading) {
         return <div className="min-h-screen flex items-center justify-center"><div className="w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" /></div>
     }
@@ -166,14 +180,48 @@ export default function Dashboard() {
     if (!user) {
         return (
             <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
-                <div className="max-w-sm w-full bg-white rounded-2xl shadow-sm border border-gray-100 p-8 text-center">
-                    <h1 className="text-2xl font-bold text-gray-900 mb-2">DEVOS Dashboard</h1>
-                    <p className="text-gray-600 mb-6 text-sm">Sign in to access the sales command centre</p>
+                <div className="max-w-sm w-full bg-white rounded-2xl shadow-sm border border-gray-100 p-8">
+                    <h1 className="text-2xl font-bold text-gray-900 mb-2 text-center">DEVOS Dashboard</h1>
+                    <p className="text-gray-600 mb-6 text-sm text-center">Sign in to access the sales command centre</p>
+
+                    <form onSubmit={handleSignIn} className="space-y-4 mb-6">
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                            <input
+                                type="email"
+                                required
+                                value={email}
+                                onChange={(e) => setEmail(e.target.value)}
+                                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                                placeholder="agent@devos.app"
+                            />
+                        </div>
+                        <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                            <input
+                                type="password"
+                                required
+                                value={password}
+                                onChange={(e) => setPassword(e.target.value)}
+                                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-blue-500 outline-none"
+                                placeholder="••••••••"
+                            />
+                        </div>
+                        {authError && <p className="text-sm text-red-600">{authError}</p>}
+                        <button
+                            type="submit"
+                            disabled={isSigningIn}
+                            className="w-full bg-blue-600 text-white py-2 rounded-xl font-semibold hover:bg-blue-700 disabled:opacity-60"
+                        >
+                            {isSigningIn ? 'Signing In...' : 'Sign In'}
+                        </button>
+                    </form>
+
                     <button
                         onClick={() => navigate('/')}
-                        className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700"
+                        className="w-full text-blue-600 py-2 rounded-xl font-medium hover:bg-blue-50 text-sm"
                     >
-                        Back to Home
+                        ← Back to Home
                     </button>
                 </div>
             </div>

@@ -45,7 +45,7 @@ export default function LeadForm({ organisation }: LeadFormProps) {
             // Parse UTM params from URL
             const params = new URLSearchParams(window.location.search)
             const utm = {
-                utm_source: params.get('utm_source') || null,
+                source_ad: params.get('utm_source') || null,
                 utm_medium: params.get('utm_medium') || null,
                 utm_campaign: params.get('utm_campaign') || null,
                 utm_content: params.get('utm_content') || null,
