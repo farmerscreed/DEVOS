@@ -3,6 +3,9 @@ import { useOrganisationFromSubdomain } from './hooks/useOrganisation'
 import LandingPage from './pages/LandingPage'
 import Dashboard from './pages/Dashboard'
 import LeadForm from './pages/LeadForm'
+import SignUp from './pages/SignUp'
+import { BuyerPortal, BuyerLogin } from './pages/BuyerPortal'
+import SiteManager from './pages/SiteManager'
 import { useEffect } from 'react'
 
 function App() {
@@ -49,6 +52,16 @@ function App() {
 
       {/* Dashboard routes */}
       <Route path="/dashboard/*" element={<Dashboard />} />
+
+      {/* Buyer portal */}
+      <Route path="/buyer/login" element={<BuyerLogin />} />
+      <Route path="/buyer" element={<BuyerPortal />} />
+
+      {/* Site Manager — mobile interface for site managers */}
+      <Route path="/site" element={<SiteManager />} />
+
+      {/* Sign up */}
+      <Route path="/signup" element={<SignUp />} />
 
       {/* Fallback */}
       <Route path="*" element={<Navigate to="/" replace />} />

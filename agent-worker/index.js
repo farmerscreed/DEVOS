@@ -14,6 +14,21 @@
 const { createClient } = require('@supabase/supabase-js');
 const https = require('https');
 const http = require('http');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+
+// Lazy-load optional dependencies
+function requirePdfKit() {
+    try { return require('pdfkit'); } catch (_) {
+        console.warn('[PDF] pdfkit not installed. Run: npm install pdfkit');
+        return null;
+    }
+}
+
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const MAX_BRIEF_CHARS = 4096;
+const MAX_BRIEF_ITEMS_PER_CATEGORY = 5;
 
 // Configuration
 const POLL_INTERVAL = 5000; // 5 seconds
@@ -414,6 +429,37 @@ async function getConversationHistory(orgId, leadId, limit = 10) {
 async function processJob(job) {
     const { id: jobId, organisation_id: orgId, agent_type, payload, attempts, lead_id } = job;
 
+    // ---------------------------------------------------------------
+    // MASTER Agent (morning brief synthesis)
+    // ---------------------------------------------------------------
+    if (agent_type === 'master') {
+        return await processMasterAgent(job);
+    }
+
+    // ---------------------------------------------------------------
+    // GUARDIAN Agent — purchase request price analysis
+    // ---------------------------------------------------------------
+    if (agent_type === 'guardian') {
+        return await processGuardianAgent(job);
+    }
+
+    // ---------------------------------------------------------------
+    // Direct-dispatch jobs — no LiteLLM call needed
+    // ---------------------------------------------------------------
+    const DIRECT_DISPATCH_TYPES = [
+        'send_payment_instructions',
+        'send_expiry_notification',
+        'send_payment_confirmation',
+        'send_payment_rejection',
+        'send_payment_reminder',
+        'send_fallback_message',
+        'generate_reservation_letter',
+    ];
+
+    if (DIRECT_DISPATCH_TYPES.includes(agent_type)) {
+        return await processDirectDispatch(job);
+    }
+
     console.log(`\n[Job ${jobId}] Processing ${agent_type} for org ${orgId}`);
     console.log(`[Job ${jobId}] Attempt: ${attempts + 1} of ${MAX_ATTEMPTS}`);
 
@@ -771,25 +817,459 @@ function defineAgentTools(agentType) {
     }
 
     if (agentType === 'guardian') {
-        return [...baseTools,
-        {
-            type: 'function',
-            function: {
-                name: 'analyze_invoice',
-                description: 'Analyze an invoice for potential issues',
-                parameters: {
-                    type: 'object',
-                    properties: {
-                        invoice_id: { type: 'string', description: 'Invoice UUID' }
-                    },
-                    required: ['invoice_id']
-                }
-            }
-        }
-        ];
+        // Guardian uses deterministic processGuardianAgent — no LiteLLM tools needed
+        return [];
+    }
+
+    // MASTER agent has no LiteLLM tools — it uses direct synthesis
+    if (agentType === 'master') {
+        return [];
     }
 
     return baseTools;
+}
+
+// ================================================================
+// MASTER AGENT — Morning Brief Synthesis
+// ================================================================
+async function processMasterAgent(job) {
+    const { id: jobId, organisation_id: orgId, payload, attempts } = job;
+    const overnightData = payload.overnight_data || {};
+    const orgName = payload.org_name || 'Your Organisation';
+    const hasActivity = payload.has_activity !== false;
+    const startTime = Date.now();
+
+    console.log(`[MASTER ${jobId}] Processing morning brief for org ${orgId}`);
+
+    try {
+        await supabase.from('agent_queue').update({ status: 'processing', started_at: new Date().toISOString() }).eq('id', jobId);
+
+        // Zero-activity short circuit
+        if (!hasActivity) {
+            await sendMasterBrief(orgId, 'All clear — nothing requires attention.');
+            await supabase.from('agent_queue').update({ status: 'completed', completed_at: new Date().toISOString() }).eq('id', jobId);
+            return;
+        }
+
+        // Build synthesis prompt
+        const summaryData = overnightData.summary || {};
+        const dataSnippet = JSON.stringify({
+            new_leads: (overnightData.new_leads || []).slice(0, MAX_BRIEF_ITEMS_PER_CATEGORY).map(l => ({ name: l.name, score: l.score, status: l.status })),
+            hot_leads_needing_attention: (overnightData.hot_leads_needing_attention || []).slice(0, MAX_BRIEF_ITEMS_PER_CATEGORY).map(l => ({ name: l.name, score: l.score })),
+            confirmed_payments: (overnightData.confirmed_payments || []).slice(0, MAX_BRIEF_ITEMS_PER_CATEGORY).map(p => ({ amount_kobo: p.amount_kobo })),
+            pending_payments: (overnightData.pending_payments || []).slice(0, MAX_BRIEF_ITEMS_PER_CATEGORY),
+            new_reservations: (overnightData.new_reservations || []).slice(0, MAX_BRIEF_ITEMS_PER_CATEGORY),
+            summary: summaryData,
+        }, null, 2);
+
+        const messages = [
+            {
+                role: 'system',
+                content: `You are MASTER, the chief of staff AI for ${orgName}'s real estate operations. ` +
+                    `Every morning you deliver a concise daily brief to the team. ` +
+                    `Focus on 2-3 key decisions or actions needed. ` +
+                    `Use plain text (no markdown too heavy), keep it under 800 words. ` +
+                    `Format: 📋 GOOD MORNING BRIEF → Key Decisions → Other Updates → All Clear Items. ` +
+                    `Do NOT mention internal IDs. Use lead names, amounts in NGN (divide kobo by 100).`
+            },
+            {
+                role: 'user',
+                content: `Overnight data for ${new Date().toDateString()}:\n\n${dataSnippet}\n\nSynthesize into a morning brief.`
+            }
+        ];
+
+        let response;
+        let usedModel = 'gpt-4o-mini';
+        try {
+            response = await callLiteLLM(messages, 'gpt-4o-mini');
+        } catch (primaryErr) {
+            console.warn(`[MASTER] GPT-4o-mini failed (${primaryErr.message}), falling back to claude-3-5-haiku`);
+            response = await callLiteLLM(messages, 'claude-3-5-haiku');
+            usedModel = 'claude-3-5-haiku';
+        }
+
+        let briefText = response.choices?.[0]?.message?.content || 'Brief generation returned empty. Check dashboard.';
+
+        // Truncate if > 4096 chars
+        if (briefText.length > MAX_BRIEF_CHARS) {
+            briefText = briefText.substring(0, MAX_BRIEF_CHARS - 100) +
+                `\n\n...\n[Brief truncated — top ${MAX_BRIEF_ITEMS_PER_CATEGORY} items per category shown. See full dashboard for details.]`;
+        }
+
+        await sendMasterBrief(orgId, briefText);
+
+        const duration = Date.now() - startTime;
+        await logAgentExecution(orgId, 'master', {
+            input_summary: `Morning brief for ${orgName} — ${JSON.stringify(summaryData)}`,
+            output_summary: briefText.substring(0, 300),
+            tool_calls_json: '[]',
+            model_used: usedModel,
+            input_tokens: response.usage?.prompt_tokens || 0,
+            output_tokens: response.usage?.completion_tokens || 0,
+            cost_usd: calculateCost(usedModel, response.usage),
+            duration_ms: duration,
+            status: 'completed'
+        });
+
+        await supabase.from('agent_queue').update({
+            status: 'completed',
+            result: { brief: briefText.substring(0, 500), model: usedModel },
+            completed_at: new Date().toISOString()
+        }).eq('id', jobId);
+
+    } catch (err) {
+        console.error(`[MASTER ${jobId}] Error:`, err.message);
+        // Fallback message
+        try { await sendMasterBrief(orgId, 'Brief generation failed. Check dashboard.'); } catch (_) { }
+
+        if (attempts + 1 >= MAX_ATTEMPTS) {
+            await supabase.from('agent_queue').update({ status: 'failed', error_message: err.message, completed_at: new Date().toISOString() }).eq('id', jobId);
+        } else {
+            await supabase.from('agent_queue').update({ status: 'pending', attempts: attempts + 1, error_message: err.message }).eq('id', jobId);
+        }
+    }
+}
+
+/** Send master brief to all admin chat IDs (Telegram) */
+async function sendMasterBrief(orgId, text) {
+    const { getAdminChatIds, sendOutboundTelegram } = require('./telegram');
+    const chatIds = await getAdminChatIds(orgId);
+    for (const chatId of chatIds) {
+        try {
+            await sendOutboundTelegram(orgId, chatId, text);
+        } catch (e) {
+            console.error(`[MASTER] Telegram send failed for chatId ${chatId}:`, e.message);
+        }
+    }
+}
+
+// ================================================================
+// DIRECT DISPATCH — Non-LLM job handlers
+// ================================================================
+async function processDirectDispatch(job) {
+    const { id: jobId, organisation_id: orgId, agent_type, payload, attempts } = job;
+    console.log(`[DirectDispatch ${jobId}] ${agent_type}`);
+
+    try {
+        await supabase.from('agent_queue').update({ status: 'processing', started_at: new Date().toISOString() }).eq('id', jobId);
+
+        let result;
+
+        switch (agent_type) {
+
+            case 'send_payment_instructions': {
+                const { lead_id, reservation_id, reference_code, expires_at, unit_id } = payload;
+
+                // Get lead + unit info
+                const { data: lead } = await supabase.from('leads').select('name, phone, telegram_chat_id, email').eq('id', lead_id).single();
+                const { data: unit } = await supabase.from('units').select('unit_number, unit_type, floor, price_kobo').eq('id', unit_id).single();
+                const { data: org } = await supabase.from('organisations').select('name').eq('id', orgId).single();
+
+                const amountNGN = unit ? (unit.price_kobo / 100).toLocaleString('en-NG') : '(see below)';
+                const expiryDate = new Date(expires_at).toLocaleString('en-NG', { timeZone: 'Africa/Lagos' });
+                const msgText = [
+                    `🏠 *Reservation Confirmed!*`,
+                    ``,
+                    `Dear ${lead?.name || 'Valued Customer'},`,
+                    ``,
+                    `Your unit has been reserved:`,
+                    `📍 Unit ${unit?.unit_number || ''} (${unit?.unit_type || ''}, Floor ${unit?.floor || 'N/A'})`,
+                    `💰 Price: ₦${amountNGN}`,
+                    ``,
+                    `*Reference Code:* \`${reference_code}\``,
+                    `*Expires:* ${expiryDate}`,
+                    ``,
+                    `To confirm your reservation, please make your deposit payment and use the reference code above.`,
+                    `Our team will confirm your payment within 24 hours.`,
+                    ``,
+                    `— ${org?.name || 'Sales Team'}`
+                ].join('\n');
+
+                // Send via Telegram if chat_id known
+                if (lead?.telegram_chat_id) {
+                    const { sendOutboundTelegram } = require('./telegram');
+                    await sendOutboundTelegram(orgId, lead.telegram_chat_id, msgText);
+                }
+
+                // Send via email if Resend configured and email known
+                if (RESEND_API_KEY && lead?.email) {
+                    await sendEmailViaResend(lead.email, `Reservation Confirmed — Ref: ${reference_code}`, msgText.replace(/\*/g, '').replace(/`/g, ''));
+                }
+
+                result = { sent: true, channels: ['telegram', 'email'], reference_code };
+                break;
+            }
+
+            case 'send_expiry_notification': {
+                const { lead_id, reference_code } = payload;
+                const { data: lead } = await supabase.from('leads').select('name, telegram_chat_id').eq('id', lead_id).single();
+
+                const text = `⚠️ *Reservation Expired*\n\nDear ${lead?.name || 'Customer'}, your reservation (Ref: ${reference_code}) has expired as payment was not received in time.\n\nPlease contact us if you wish to re-reserve a unit.`;
+
+                if (lead?.telegram_chat_id) {
+                    const { sendOutboundTelegram } = require('./telegram');
+                    await sendOutboundTelegram(orgId, lead.telegram_chat_id, text);
+                }
+                result = { sent: true, lead_id, reference_code };
+                break;
+            }
+
+            case 'send_payment_confirmation': {
+                const { buyer_id, amount_kobo } = payload;
+                const { data: buyer } = await supabase.from('buyers').select('*, leads(name, telegram_chat_id)').eq('id', buyer_id).single();
+
+                const amountNGN = ((amount_kobo || 0) / 100).toLocaleString('en-NG');
+                const text = `✅ *Payment Confirmed!*\n\nDear ${buyer?.leads?.name || 'Customer'}, we have confirmed your payment of ₦${amountNGN}.\n\nThank you! Your Reservation Letter will be sent shortly.`;
+
+                if (buyer?.leads?.telegram_chat_id) {
+                    const { sendOutboundTelegram } = require('./telegram');
+                    await sendOutboundTelegram(orgId, buyer.leads.telegram_chat_id, text);
+                }
+                result = { sent: true, buyer_id };
+                break;
+            }
+
+            case 'send_payment_rejection': {
+                const { buyer_id, reason } = payload;
+                const { data: buyer } = await supabase.from('buyers').select('*, leads(name, telegram_chat_id)').eq('id', buyer_id).single();
+
+                const text = `❌ *Payment Not Confirmed*\n\nDear ${buyer?.leads?.name || 'Customer'}, we were unable to confirm your payment.\n\n*Reason:* ${reason || 'Please contact us for details.'}\n\nThe unit has been released. Please contact our team to discuss next steps.`;
+
+                if (buyer?.leads?.telegram_chat_id) {
+                    const { sendOutboundTelegram } = require('./telegram');
+                    await sendOutboundTelegram(orgId, buyer.leads.telegram_chat_id, text);
+                }
+                result = { sent: true, buyer_id };
+                break;
+            }
+
+            case 'send_payment_reminder': {
+                const { buyer_id, lead_id: reminderLeadId, days_until_due, due_date, total_amount_kobo, amount_kobo, instalment_number, urgent } = payload;
+                const { data: lead } = await supabase.from('leads').select('name, telegram_chat_id').eq('id', reminderLeadId).single();
+
+                const amount = total_amount_kobo || amount_kobo || 0;
+                const amountNGN = (amount / 100).toLocaleString('en-NG');
+                const urgentFlag = urgent ? '🚨 URGENT: ' : '⏰ Reminder: ';
+                const text = `${urgentFlag}*Payment Due in ${days_until_due} Days*\n\nDear ${lead?.name || 'Customer'},\n\nYour payment of ₦${amountNGN} is due on ${due_date}.\n\nPlease ensure timely payment to avoid any impact on your reservation.\n\nContact us if you need assistance.`;
+
+                if (lead?.telegram_chat_id) {
+                    const { sendOutboundTelegram } = require('./telegram');
+                    await sendOutboundTelegram(orgId, lead.telegram_chat_id, text);
+                }
+                result = { sent: true, buyer_id, days_until_due };
+                break;
+            }
+
+            case 'generate_reservation_letter': {
+                result = await generateReservationLetterPDF(orgId, payload);
+                break;
+            }
+
+            case 'send_fallback_message': {
+                const { text: fallbackText, message } = payload;
+                const briefText = fallbackText || message || 'Brief generation failed. Check dashboard.';
+                await sendMasterBrief(orgId, briefText);
+                result = { sent: true };
+                break;
+            }
+
+            default:
+                throw new Error(`Unknown direct dispatch type: ${agent_type}`);
+        }
+
+        await supabase.from('agent_queue').update({
+            status: 'completed',
+            result,
+            completed_at: new Date().toISOString()
+        }).eq('id', jobId);
+
+        console.log(`[DirectDispatch ${jobId}] ${agent_type} completed`);
+
+    } catch (err) {
+        console.error(`[DirectDispatch ${jobId}] Error:`, err.message);
+
+        if (attempts + 1 >= MAX_ATTEMPTS) {
+            await supabase.from('agent_queue').update({ status: 'failed', error_message: err.message, attempts: attempts + 1, completed_at: new Date().toISOString() }).eq('id', jobId);
+        } else {
+            await supabase.from('agent_queue').update({ status: 'pending', attempts: attempts + 1, error_message: err.message }).eq('id', jobId);
+        }
+    }
+}
+
+// ================================================================
+// PDF GENERATION — Reservation Letter
+// ================================================================
+async function generateReservationLetterPDF(orgId, payload) {
+    const PDFDocument = requirePdfKit();
+    if (!PDFDocument) {
+        // pdfkit not installed — mark document as failed and log
+        await supabase.from('documents').update({ status: 'failed' })
+            .eq('reservation_id', payload.reservation_id).eq('document_type', 'reservation_letter');
+        // Alert admins
+        await sendMasterBrief(orgId, `⚠️ PDF generation failed: pdfkit not installed. Run \`npm install pdfkit\` on the agent worker.`);
+        return { success: false, reason: 'pdfkit not installed' };
+    }
+
+    const { buyer_id, reservation_id } = payload;
+
+    // Fetch all needed data
+    const { data: reservation } = await supabase
+        .from('reservations')
+        .select('*, units(unit_number, unit_type, floor, price_kobo), buyers(*, leads(name, phone, email))')
+        .eq('id', reservation_id).single();
+
+    const { data: org } = await supabase.from('organisations').select('name, settings').eq('id', orgId).single();
+
+    if (!reservation) {
+        throw new Error(`Reservation ${reservation_id} not found for PDF generation`);
+    }
+
+    const buyerName = reservation.buyers?.leads?.name || 'Valued Customer';
+    const buyerPhone = reservation.buyers?.leads?.phone || '';
+    const unitNumber = reservation.units?.unit_number || 'N/A';
+    const unitType = reservation.units?.unit_type || 'N/A';
+    const floor = reservation.units?.floor || 'N/A';
+    const priceNGN = ((reservation.units?.price_kobo || 0) / 100).toLocaleString('en-NG');
+    const refCode = reservation.reference_code || 'N/A';
+    const expiryDate = reservation.expires_at ? new Date(reservation.expires_at).toLocaleDateString('en-NG') : 'N/A';
+    const orgName = org?.name || 'DEVOS';
+    const today = new Date().toLocaleDateString('en-NG', { day: 'numeric', month: 'long', year: 'numeric' });
+
+    // Generate PDF to temp
+    const tmpPath = path.join(os.tmpdir(), `reservation_${reservation_id}_${Date.now()}.pdf`);
+
+    await new Promise((resolve, reject) => {
+        const doc = new PDFDocument({ margin: 60 });
+        const stream = fs.createWriteStream(tmpPath);
+        doc.pipe(stream);
+
+        // Header
+        doc.fontSize(20).font('Helvetica-Bold').text(orgName, { align: 'center' });
+        doc.fontSize(14).font('Helvetica').text('RESERVATION LETTER', { align: 'center' });
+        doc.moveDown();
+        doc.fontSize(10).text(`Date: ${today}`, { align: 'right' });
+        doc.text(`Reference: ${refCode}`, { align: 'right' });
+        doc.moveDown();
+
+        // Addressee
+        doc.fontSize(11).font('Helvetica-Bold').text('Dear ' + buyerName + ',');
+        doc.moveDown(0.5);
+        doc.font('Helvetica').text(
+            `We are pleased to confirm that the following unit has been reserved in your name. ` +
+            `Please review the details below and make your deposit payment using the reference code provided.`
+        );
+        doc.moveDown();
+
+        // Unit details
+        doc.font('Helvetica-Bold').text('UNIT DETAILS');
+        doc.moveTo(60, doc.y).lineTo(550, doc.y).stroke();
+        doc.moveDown(0.3);
+        doc.font('Helvetica');
+        const details = [
+            ['Unit Number', unitNumber],
+            ['Unit Type', unitType],
+            ['Floor', floor.toString()],
+            ['Sale Price', `₦${priceNGN}`],
+            ['Reservation Ref', refCode],
+            ['Reservation Expiry', expiryDate],
+        ];
+        for (const [label, value] of details) {
+            doc.text(`${label}:`, 60, undefined, { continued: true, width: 200 });
+            doc.text(value);
+        }
+        doc.moveDown();
+
+        // Payment instructions
+        doc.font('Helvetica-Bold').text('PAYMENT INSTRUCTIONS');
+        doc.moveTo(60, doc.y).lineTo(550, doc.y).stroke();
+        doc.moveDown(0.3);
+        doc.font('Helvetica').text(
+            `To secure your reservation, please make your deposit payment and include the reference code \"${refCode}\" ` +
+            `in your payment description. Send your payment receipt to our sales team for confirmation.`
+        );
+        doc.moveDown();
+
+        // Footer
+        doc.fontSize(9).fillColor('grey');
+        doc.text('This letter is computer-generated and valid without a physical signature.', { align: 'center' });
+        doc.text(`${orgName} — Generated by DEVOS`, { align: 'center' });
+
+        doc.end();
+        stream.on('finish', resolve);
+        stream.on('error', reject);
+    });
+
+    // Validate file size
+    const stats = fs.statSync(tmpPath);
+    if (stats.size === 0) {
+        fs.unlinkSync(tmpPath);
+        throw new Error('Generated PDF is empty');
+    }
+
+    // Upload to Supabase Storage
+    const storagePath = `documents/${orgId}/reservation_${reservation_id}.pdf`;
+    const fileBuffer = fs.readFileSync(tmpPath);
+
+    const { error: uploadErr } = await supabase.storage
+        .from('documents')
+        .upload(storagePath, fileBuffer, { contentType: 'application/pdf', upsert: true });
+
+    if (uploadErr) throw uploadErr;
+
+    // Get public URL
+    const { data: urlData } = supabase.storage.from('documents').getPublicUrl(storagePath);
+    const fileUrl = urlData.publicUrl;
+
+    // Update documents table
+    await supabase.from('documents')
+        .update({ status: 'ready', file_url: fileUrl })
+        .eq('reservation_id', reservation_id)
+        .eq('document_type', 'reservation_letter');
+
+    // Clean up temp file
+    try { fs.unlinkSync(tmpPath); } catch (_) { }
+
+    console.log(`[PDF] Reservation letter generated for ${reservation_id}: ${fileUrl}`);
+    return { success: true, file_url: fileUrl, reservation_id };
+}
+
+/**
+ * Send email via Resend API
+ */
+async function sendEmailViaResend(toEmail, subject, bodyText) {
+    if (!RESEND_API_KEY) return { skipped: true, reason: 'RESEND_API_KEY not configured' };
+
+    return new Promise((resolve, reject) => {
+        const payload = JSON.stringify({
+            from: 'noreply@devos.app',
+            to: [toEmail],
+            subject,
+            text: bodyText,
+        });
+
+        const options = {
+            hostname: 'api.resend.com',
+            port: 443,
+            path: '/emails',
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${RESEND_API_KEY}`,
+                'Content-Length': Buffer.byteLength(payload),
+            },
+        };
+
+        const req = https.request(options, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try { resolve(JSON.parse(data)); } catch (_) { resolve({ raw: data }); }
+            });
+        });
+        req.on('error', reject);
+        req.write(payload);
+        req.end();
+    });
 }
 
 /**
@@ -839,6 +1319,12 @@ async function executeTool(toolCall, orgId, job) {
 
         case 'analyze_invoice':
             return await analyzeInvoice(orgId, params.invoice_id);
+
+        case 'lookup_price_index':
+            return await lookupPriceIndex(params.material_name, params.region);
+
+        case 'check_budget_impact':
+            return await checkBudgetImpact(orgId, params.phase_id, params.total_kobo);
 
         default:
             throw new Error(`Unknown tool: ${name}`);
@@ -1030,6 +1516,237 @@ function calculateCost(model, usage) {
     const outputCost = (usage.completion_tokens / 1000) * rates.output;
 
     return inputCost + outputCost;
+}
+
+// ================================================================
+// GUARDIAN AGENT — Purchase Request Price Analysis
+// ================================================================
+
+// Flag thresholds: ≤5% CLEAR, 5.1-15% INFO, 15.1-30% WARNING, >30% CRITICAL
+function calcPriceFlag(deviationPct) {
+    if (deviationPct <= 5) return 'CLEAR';
+    if (deviationPct <= 15) return 'INFO';
+    if (deviationPct <= 30) return 'WARNING';
+    return 'CRITICAL';
+}
+
+async function lookupPriceIndex(materialName, region = 'Lagos') {
+    const { data } = await supabase
+        .from('price_index')
+        .select('material_name, unit, rate_kobo, region, effective_date')
+        .ilike('material_name', `%${materialName}%`)
+        .eq('region', region)
+        .order('effective_date', { ascending: false })
+        .limit(3);
+    return data || [];
+}
+
+async function checkBudgetImpact(orgId, phaseId, totalKobo) {
+    if (!phaseId) return null;
+    const { data: phase } = await supabase
+        .from('budget_phases')
+        .select('phase_name, category, allocated_kobo, spent_kobo, contingency_pct')
+        .eq('id', phaseId)
+        .eq('organisation_id', orgId)
+        .single();
+    if (!phase) return null;
+    const contingencyBuffer = phase.allocated_kobo * ((phase.contingency_pct || 0) / 100);
+    const effectiveCeiling = phase.allocated_kobo + contingencyBuffer;
+    const remainingKobo = effectiveCeiling - phase.spent_kobo;
+    return {
+        phase_name: phase.phase_name,
+        allocated_kobo: phase.allocated_kobo,
+        spent_kobo: phase.spent_kobo,
+        contingency_pct: phase.contingency_pct || 0,
+        effective_ceiling_kobo: effectiveCeiling,
+        remaining_kobo: remainingKobo,
+        total_cost_kobo: totalKobo,
+        would_breach: totalKobo > remainingKobo,
+        utilisation_pct: Math.round(((phase.spent_kobo + totalKobo) / effectiveCeiling) * 100),
+    };
+}
+
+async function processGuardianAgent(job) {
+    const { id: jobId, organisation_id: orgId, payload, attempts } = job;
+    const {
+        purchase_request_id, material_name, quantity,
+        unit = 'item', unit_rate_kobo, phase_id,
+    } = payload;
+
+    await supabase.from('agent_queue')
+        .update({ status: 'processing', started_at: new Date().toISOString() })
+        .eq('id', jobId);
+
+    const startTime = Date.now();
+
+    try {
+        console.log(`[GUARDIAN ${jobId}] Analyzing PR ${purchase_request_id}`);
+
+        // Fetch org for region + settings
+        const { data: org } = await supabase.from('organisations')
+            .select('name, settings').eq('id', orgId).single();
+        const region = org?.settings?.region || 'Lagos';
+        const autoApproveEnabled = org?.settings?.auto_approve_enabled !== false;
+
+        // 1. Price index lookup
+        const priceEntries = await lookupPriceIndex(material_name, region);
+
+        let priceAnalysis = null;
+        let priceFlag = 'INFO';
+
+        if (priceEntries.length > 0) {
+            const marketRate = priceEntries[0].rate_kobo;
+            const deviation = ((unit_rate_kobo - marketRate) / marketRate) * 100;
+            priceFlag = calcPriceFlag(deviation);
+            priceAnalysis = {
+                market_rate_kobo: marketRate,
+                submitted_rate_kobo: unit_rate_kobo,
+                deviation_pct: Math.round(deviation * 100) / 100,
+                flag: priceFlag,
+                reference_material: priceEntries[0].material_name,
+                effective_date: priceEntries[0].effective_date,
+            };
+        }
+
+        // 2. Budget impact check
+        const totalKobo = quantity * unit_rate_kobo;
+        const budgetAnalysis = await checkBudgetImpact(orgId, phase_id, totalKobo);
+
+        // 3. Determine overall flag (worst of price + budget)
+        let guardianFlag = priceFlag;
+        if (budgetAnalysis?.would_breach) guardianFlag = 'CRITICAL';
+
+        // 4. LiteLLM narrative (Claude Sonnet primary, GPT-4o fallback)
+        let narrative = '';
+        try {
+            const llmConfig = await getLLMConfig(orgId, 'guardian');
+            const primaryModel = llmConfig?.primary_model || 'claude-sonnet-4-5';
+            const fallbackModel = llmConfig?.fallback_model || 'gpt-4o';
+
+            const contextSummary = JSON.stringify({
+                material: material_name,
+                quantity,
+                unit,
+                submitted_rate_kobo: unit_rate_kobo,
+                price_analysis: priceAnalysis,
+                budget_analysis: budgetAnalysis,
+                overall_flag: guardianFlag,
+            }, null, 2);
+
+            const msgs = [
+                {
+                    role: 'system',
+                    content: `You are GUARDIAN, a construction procurement compliance agent for a Nigerian real estate developer.
+Write a concise 2-3 sentence analysis of this purchase request.
+Be direct: state the flag level, the reason, and whether action is required.
+Use ₦ for currency. Quote deviation percentages and budget figures.`,
+                },
+                { role: 'user', content: `Analyze:\n${contextSummary}` },
+            ];
+
+            let resp;
+            try {
+                resp = await callLiteLLM(msgs, primaryModel);
+            } catch {
+                resp = await callLiteLLM(msgs, fallbackModel);
+            }
+            narrative = resp.choices?.[0]?.message?.content || '';
+        } catch (e) {
+            // Fallback narrative
+            const devStr = priceAnalysis ? ` Price deviation: ${priceAnalysis.deviation_pct.toFixed(1)}%.` : '';
+            const budgStr = budgetAnalysis?.would_breach ? ' BUDGET CEILING WOULD BE BREACHED.' : '';
+            narrative = `GUARDIAN flag: ${guardianFlag}.${devStr}${budgStr} ${guardianFlag === 'CRITICAL' ? 'Auto-rejected.' : guardianFlag === 'CLEAR' ? 'All checks passed.' : 'Pending developer review.'}`;
+        }
+
+        // 5. Determine auto action
+        let autoAction = null;
+        if (guardianFlag === 'CRITICAL') {
+            autoAction = 'rejected';
+        } else if (autoApproveEnabled && guardianFlag === 'CLEAR') {
+            autoAction = 'approved';
+        }
+
+        const analysis = {
+            flag: guardianFlag,
+            price_analysis: priceAnalysis,
+            budget_analysis: budgetAnalysis,
+            narrative,
+            analyzed_at: new Date().toISOString(),
+            auto_action: autoAction,
+        };
+
+        // 6. Update purchase request
+        const prUpdate = {
+            guardian_analysis: analysis,
+            guardian_flag: guardianFlag,
+            updated_at: new Date().toISOString(),
+        };
+        if (autoAction) prUpdate.status = autoAction;
+
+        await supabase.from('purchase_requests').update(prUpdate).eq('id', purchase_request_id);
+
+        // 7. If auto-approved → create payment ticket
+        if (autoAction === 'approved') {
+            const refCode = `PT-${Date.now().toString(36).toUpperCase()}-AUTO`;
+            await supabase.from('approvals').insert({
+                organisation_id: orgId,
+                reference_type: 'purchase_request',
+                reference_id: purchase_request_id,
+                action: 'approved',
+                notes: `Auto-approved by GUARDIAN. Flag: ${guardianFlag}`,
+            });
+            await supabase.from('payment_tickets').insert({
+                organisation_id: orgId,
+                purchase_request_id,
+                amount_kobo: totalKobo,
+                reference_code: refCode,
+                status: 'pending',
+                generated_by: payload.submitted_by,
+                generated_at: new Date().toISOString(),
+            });
+            console.log(`[GUARDIAN ${jobId}] Auto-approved → ticket ${refCode}`);
+        }
+
+        // 8. If CRITICAL → auto-rejected, log
+        if (autoAction === 'rejected') {
+            await supabase.from('approvals').insert({
+                organisation_id: orgId,
+                reference_type: 'purchase_request',
+                reference_id: purchase_request_id,
+                action: 'rejected',
+                notes: `Auto-rejected by GUARDIAN. Flag: CRITICAL. ${priceAnalysis ? `Deviation: ${priceAnalysis.deviation_pct.toFixed(1)}%.` : ''} ${budgetAnalysis?.would_breach ? 'Budget breach.' : ''}`,
+            });
+            console.log(`[GUARDIAN ${jobId}] Auto-rejected (CRITICAL)`);
+        }
+
+        const duration = Date.now() - startTime;
+        await logAgentExecution(orgId, 'guardian', {
+            input_summary: `PR ${purchase_request_id}: ${material_name} ×${quantity} @ ${(unit_rate_kobo / 100).toFixed(0)} kobo/${unit}`,
+            output_summary: `Flag: ${guardianFlag}. Auto: ${autoAction || 'pending_review'}`,
+            tool_calls_json: JSON.stringify([{ price_analysis: priceAnalysis, budget_analysis: budgetAnalysis }]),
+            model_used: 'guardian',
+            cost_usd: 0,
+            duration_ms: duration,
+            status: 'completed',
+        });
+
+        await supabase.from('agent_queue').update({
+            status: 'completed',
+            result: { flag: guardianFlag, auto_action: autoAction },
+            completed_at: new Date().toISOString(),
+        }).eq('id', jobId);
+
+        console.log(`[GUARDIAN ${jobId}] Done. Flag: ${guardianFlag}, Auto: ${autoAction || 'none'}`);
+
+    } catch (error) {
+        console.error(`[GUARDIAN ${jobId}] Error: ${error.message}`);
+        await supabase.from('agent_queue').update({
+            status: attempts + 1 >= MAX_ATTEMPTS ? 'failed' : 'pending',
+            error_message: error.message,
+            attempts: attempts + 1,
+            completed_at: new Date().toISOString(),
+        }).eq('id', jobId);
+    }
 }
 
 /**
