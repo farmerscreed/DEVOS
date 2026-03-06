@@ -1,8 +1,14 @@
 # DEVOS — Full System Test Plan
-**Phase 1 → Sprint 4 | Telegram Edition**
+**Phase 1 (complete) → Sprint 4 | Telegram Edition**
 
-Run every block in order on first test. On subsequent runs you can jump to specific blocks.
-Each block has a **PASS** condition — do not proceed to the next block until it passes.
+17 blocks covering every feature end-to-end.
+Run in order on first test. On subsequent runs jump to any block.
+Each block has a **PASS** condition — do not proceed until it passes.
+
+| Phase | Blocks | Features |
+|---|---|---|
+| Phase 1 | 1–10 | Lead capture, PRESELL agent, hot alerts, morning brief, reservation, finance, buyer portal |
+| Sprint 4 | 11–17 | Budget manager, site manager, GUARDIAN agent, developer approvals, price index, progress updates |
 
 ---
 
@@ -280,7 +286,267 @@ Expected: `status = completed`, `output_summary` contains summary text
 
 ---
 
-## BLOCK 7 — Budget Manager (T4.1)
+## BLOCK 7 — Reservation Workflow
+
+**Tests:** `reserve-unit` edge function, atomic unit lock, buyer record creation, payment schedule generation, payment instruction dispatch via Telegram
+
+### Prerequisites
+
+You need:
+- A lead with `status = hot_lead` or `category = hot` (from Block 4)
+- An `available` unit (from Block 5)
+
+Get the IDs you'll need:
+```sql
+SELECT id, name, category, status FROM leads ORDER BY updated_at DESC LIMIT 3;
+SELECT id, unit_number, status, price_kobo/100 AS price_naira FROM units WHERE status = 'available' LIMIT 3;
+SELECT id FROM organisations LIMIT 1;
+```
+
+### Steps
+
+The reservation is triggered from the Dashboard lead detail page:
+
+1. Dashboard → **PRESELL Agent → Leads**
+2. Click your hot lead (`Test User One`)
+3. In the lead detail panel, find the **Reserve Unit** button (or **Units** tab)
+4. Select unit `A-101` → click **Reserve**
+5. Confirm the reservation
+
+If the UI button is not yet wired up, trigger directly via curl (replace the IDs):
+
+```bash
+curl -X POST https://gvcadlzjpsfabrqkzdwt.supabase.co/functions/v1/reserve-unit \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <YOUR_USER_JWT>" \
+  -d '{
+    "unit_id": "<UNIT_ID>",
+    "lead_id": "<LEAD_ID>",
+    "organisation_id": "0a697de3-7fe5-421a-a3f5-e47829cc21de"
+  }'
+```
+
+> **How to get your JWT:** In browser DevTools → Application → Local Storage → `supabase.auth.token` → copy `access_token`
+
+### Verify
+
+Expected response:
+```json
+{ "success": true, "reservation": { "reservation_id": "...", "reference_code": "RES-XXXXX", "expires_at": "..." } }
+```
+
+**Unit status flipped:**
+```sql
+SELECT unit_number, status, buyer_id FROM units WHERE unit_number = 'A-101';
+```
+Expected: `status = reserved`
+
+**Reservation created:**
+```sql
+SELECT id, status, deposit_kobo, payment_plan, expires_at
+FROM reservations
+ORDER BY created_at DESC LIMIT 1;
+```
+Expected: row with `status = pending`, `expires_at` ~48 hours from now
+
+**Buyer record created:**
+```sql
+SELECT id, organisation_id, unit_id, status
+FROM buyers
+ORDER BY created_at DESC LIMIT 1;
+```
+Expected: new buyer row linked to the unit
+
+**Payment schedule generated:**
+```sql
+SELECT instalment_number, amount_kobo/100 AS amount_naira, due_date, status
+FROM payment_schedule
+ORDER BY instalment_number ASC;
+```
+Expected: multiple instalment rows (e.g. deposit + 3 instalments), all `status = pending`
+
+**Payment instruction dispatched:**
+```sql
+SELECT agent_type, status, payload->>'action' AS action
+FROM agent_queue
+ORDER BY created_at DESC LIMIT 3;
+```
+Expected: a `send_payment_instructions` job
+
+**Telegram (bot chat):** The buyer receives a payment instruction message with the reference code and bank details
+
+**PASS:** Unit = `reserved`. Reservation row exists. Payment schedule created. Telegram payment instruction sent.
+
+---
+
+## BLOCK 8 — Simulate Buyer Payment Submission
+
+**Tests:** `payments_in` record creation, finance queue population
+
+Before finance can confirm, there needs to be a pending payment record. Create one manually (simulating the buyer uploading a receipt):
+
+```sql
+-- Get the reservation and buyer IDs from Block 7
+WITH r AS (SELECT id AS res_id, buyer_id FROM reservations ORDER BY created_at DESC LIMIT 1)
+INSERT INTO payments_in (
+  organisation_id, buyer_id, reservation_id,
+  amount_kobo, reference_code, payment_method, status
+)
+SELECT
+  '0a697de3-7fe5-421a-a3f5-e47829cc21de',
+  buyer_id,
+  res_id,
+  50000000,        -- ₦500,000 deposit
+  'TEST-PAY-001',
+  'bank_transfer',
+  'pending'
+FROM r;
+```
+
+### Verify
+
+```sql
+SELECT id, amount_kobo/100 AS amount_naira, reference_code, status
+FROM payments_in
+ORDER BY created_at DESC LIMIT 3;
+```
+Expected: new row with `status = pending`
+
+**PASS:** Pending payment record exists in `payments_in`.
+
+---
+
+## BLOCK 9 — Finance Confirmation
+
+**Tests:** Finance View UI, `on-payment-confirmed` edge function, reservation activation, document generation queue
+
+### Steps
+
+1. Dashboard → **Finance → Finance View**
+2. You should see the pending payment `TEST-PAY-001` listed
+3. Click **Confirm** on that payment
+4. A confirmation dialog appears → confirm
+
+### Verify
+
+**Payment status updated:**
+```sql
+SELECT id, status, confirmed_by, confirmed_at
+FROM payments_in
+ORDER BY created_at DESC LIMIT 1;
+```
+Expected: `status = confirmed`, `confirmed_at` populated
+
+**Reservation activated:**
+```sql
+SELECT id, status, deposit_paid_at
+FROM reservations
+ORDER BY created_at DESC LIMIT 1;
+```
+Expected: `status = active`, `deposit_paid_at` populated
+
+**Payment schedule instalment marked paid:**
+```sql
+SELECT instalment_number, status, paid_at
+FROM payment_schedule
+ORDER BY instalment_number ASC LIMIT 3;
+```
+Expected: instalment 1 → `status = paid`
+
+**Reservation letter queued:**
+```sql
+SELECT document_type, status FROM documents ORDER BY created_at DESC LIMIT 3;
+```
+Expected: `document_type = reservation_letter`, `status = generating`
+
+**Agent queue jobs dispatched:**
+```sql
+SELECT agent_type, status FROM agent_queue
+WHERE agent_type IN ('generate_reservation_letter', 'send_payment_confirmation')
+ORDER BY created_at DESC LIMIT 3;
+```
+Expected: both jobs queued
+
+**Telegram (bot chat):** Buyer receives a payment confirmation message
+
+### Test the REJECT path
+
+Back in Finance View, find another pending payment (or insert another one via the SQL above with a different reference code) and click **Reject** → enter a reason.
+
+```sql
+SELECT status FROM payments_in ORDER BY created_at DESC LIMIT 2;
+SELECT status FROM reservations ORDER BY created_at DESC LIMIT 1;
+SELECT status FROM units WHERE unit_number = 'A-101';
+```
+Expected on rejection: `payments_in.status = rejected`, `reservations.status = cancelled`, `units.status = available` (unit returned to market)
+
+**PASS:** Payment confirmed. Reservation active. Schedule updated. Letter queued. Buyer notified via Telegram.
+
+---
+
+## BLOCK 10 — Buyer Portal
+
+**Tests:** Buyer login, payment progress display, documents, support chat
+
+### Prerequisites
+
+You need a buyer auth account. The `buyers` table stores buyer records but login uses Supabase Auth. Create a test buyer auth user:
+
+1. Go to Supabase Dashboard → Authentication → Users → **Add user**
+2. Enter an email + password (e.g. `buyer@test.com` / `TestBuyer123`)
+3. Copy the new user's UUID
+4. Link the buyer record to this user:
+
+```sql
+UPDATE buyers
+SET user_id = '<NEW_AUTH_USER_UUID>'
+WHERE id = (SELECT id FROM buyers ORDER BY created_at DESC LIMIT 1);
+```
+
+> Note: if the `buyers` table doesn't have a `user_id` column yet, the portal uses the auth session to look up by email — just ensure the buyer email matches.
+
+### Steps
+
+1. Open `http://localhost:5173/buyer/login`
+2. Sign in with `buyer@test.com` / `TestBuyer123`
+3. You are redirected to `http://localhost:5173/buyer`
+
+### Verify — Payment Progress
+
+The portal should show:
+- Unit details (Block A-101, flat, 3 bed)
+- Reservation reference code
+- Payment schedule with instalment statuses (instalment 1 = paid, rest = pending)
+- A progress bar showing % of total paid
+
+### Verify — Documents
+
+Documents section should show the reservation letter (status: `generating` or `ready` if agent processed it)
+
+```sql
+SELECT document_type, status, file_url FROM documents
+WHERE buyer_id = (SELECT id FROM buyers ORDER BY created_at DESC LIMIT 1);
+```
+
+### Verify — Support Chat
+
+1. In the Buyer Portal → scroll to **Support** section
+2. Type a message: `"When is my next payment due?"`
+3. Click **Send**
+
+```sql
+SELECT direction, content, channel, source
+FROM message_threads
+WHERE channel = 'buyer_portal'
+ORDER BY created_at DESC LIMIT 3;
+```
+Expected: row with `direction = inbound`, `source = buyer_portal`
+
+**PASS:** Buyer portal loads with reservation, payment schedule, and documents. Support message logged.
+
+---
+
+## BLOCK 11 — Budget Manager (T4.1)
 
 **Tests:** Budget phase creation, line items, health indicators
 
@@ -337,7 +603,7 @@ Expected: 1 phase row, 2 line item rows with correct totals.
 
 ---
 
-## BLOCK 8 — Site Manager: Submit Purchase Request (T4.5 + T4.6)
+## BLOCK 12 — Site Manager: Submit Purchase Request (T4.5 + T4.6)
 
 **Tests:** Site manager mobile UI, purchase request submission, GUARDIAN job dispatch
 
@@ -380,7 +646,7 @@ Expected: a `guardian` job in `pending` or `completed`
 
 ---
 
-## BLOCK 9 — GUARDIAN Agent Analysis (T4.7)
+## BLOCK 13 — GUARDIAN Agent Analysis (T4.7)
 
 **Tests:** Price index comparison, flag levels, auto-approve / auto-reject logic
 
@@ -440,7 +706,7 @@ Expected second row:
 
 ---
 
-## BLOCK 10 — Developer Approval Interface (T4.8)
+## BLOCK 14 — Developer Approval Interface (T4.8)
 
 **Tests:** Approval UI, flag colour-coding, GUARDIAN analysis display
 
@@ -460,7 +726,7 @@ Expected second row:
 
 ---
 
-## BLOCK 11 — Approve a Purchase Request (T4.9)
+## BLOCK 15 — Approve a Purchase Request (T4.9)
 
 **Tests:** Separation of duties, payment ticket generation, `spent_kobo` trigger
 
@@ -525,7 +791,7 @@ Expected: `spent_kobo` = 100 bags × ₦8,500 = ₦850,000
 
 ---
 
-## BLOCK 12 — Price Index (T4.3)
+## BLOCK 16 — Price Index (T4.3)
 
 **Tests:** Seed data, price lookup, update function
 
@@ -567,7 +833,7 @@ Expected response:
 
 ---
 
-## BLOCK 13 — Progress Update (T4.5)
+## BLOCK 17 — Progress Update (T4.5)
 
 **Tests:** Site manager progress submission, `progress_updates` table
 
@@ -606,22 +872,31 @@ Run this single query — all counts should be > 0:
 
 ```sql
 SELECT
-  (SELECT COUNT(*) FROM leads)                           AS leads,
-  (SELECT COUNT(*) FROM leads WHERE preferred_channel='telegram') AS telegram_leads,
-  (SELECT COUNT(*) FROM message_threads)                 AS messages,
-  (SELECT COUNT(*) FROM agent_queue WHERE status='completed') AS completed_jobs,
-  (SELECT COUNT(*) FROM agent_logs)                      AS agent_logs,
-  (SELECT COUNT(*) FROM price_index)                     AS price_index,
-  (SELECT COUNT(*) FROM budget_phases)                   AS budget_phases,
-  (SELECT COUNT(*) FROM budget_line_items)               AS line_items,
-  (SELECT COUNT(*) FROM purchase_requests)               AS purchase_requests,
+  (SELECT COUNT(*) FROM leads)                                        AS leads,
+  (SELECT COUNT(*) FROM leads WHERE preferred_channel = 'telegram')   AS telegram_leads,
+  (SELECT COUNT(*) FROM leads WHERE category = 'hot')                 AS hot_leads,
+  (SELECT COUNT(*) FROM message_threads)                              AS messages,
+  (SELECT COUNT(*) FROM message_threads WHERE channel = 'buyer_portal') AS buyer_support_msgs,
+  (SELECT COUNT(*) FROM agent_queue WHERE status = 'completed')       AS completed_jobs,
+  (SELECT COUNT(*) FROM agent_logs)                                   AS agent_logs,
+  (SELECT COUNT(*) FROM reservations)                                 AS reservations,
+  (SELECT COUNT(*) FROM reservations WHERE status = 'active')         AS active_reservations,
+  (SELECT COUNT(*) FROM buyers)                                       AS buyers,
+  (SELECT COUNT(*) FROM payment_schedule)                             AS payment_schedule_rows,
+  (SELECT COUNT(*) FROM payments_in)                                  AS payments_in,
+  (SELECT COUNT(*) FROM payments_in WHERE status = 'confirmed')       AS confirmed_payments,
+  (SELECT COUNT(*) FROM documents)                                    AS documents,
+  (SELECT COUNT(*) FROM price_index)                                  AS price_index,
+  (SELECT COUNT(*) FROM budget_phases)                                AS budget_phases,
+  (SELECT COUNT(*) FROM budget_line_items)                            AS line_items,
+  (SELECT COUNT(*) FROM purchase_requests)                            AS purchase_requests,
   (SELECT COUNT(*) FROM purchase_requests WHERE guardian_flag IS NOT NULL) AS guardian_analyzed,
-  (SELECT COUNT(*) FROM payment_tickets)                 AS payment_tickets,
-  (SELECT COUNT(*) FROM approvals)                       AS approvals,
-  (SELECT COUNT(*) FROM progress_updates)                AS progress_updates;
+  (SELECT COUNT(*) FROM payment_tickets)                              AS payment_tickets,
+  (SELECT COUNT(*) FROM approvals)                                    AS approvals,
+  (SELECT COUNT(*) FROM progress_updates)                             AS progress_updates;
 ```
 
-All values should be ≥ 1. `guardian_analyzed` should be ≥ 2 (CLEAR + CRITICAL test).
+All values should be ≥ 1. `guardian_analyzed` should be ≥ 2 (CLEAR + CRITICAL test). `confirmed_payments` ≥ 1 after Block 9.
 
 ---
 
